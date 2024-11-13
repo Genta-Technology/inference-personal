@@ -1,0 +1,27 @@
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+CMakeUserPresets.json
+
+# ignore build directories
+build/**
+test_cpu/build/**
+test_gpu/build/**
+
+# ignore model directories
+models/**
+model-hf/**
+test_cpu/models/**
+test_cpu/tokenizer/**
+test_gpu/models/**
+test_gpu/tokenizer/**
+
+.vscode/
