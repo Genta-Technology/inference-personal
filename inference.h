@@ -72,7 +72,7 @@ struct CompletionResult
  *
  * The engine is responsible for managing the completion jobs and returning the results.
  */
-class InferenceEngine 
+class InferenceEngine
 {
 public:
 	/**
