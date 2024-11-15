@@ -12,16 +12,23 @@ _deps
 CMakeUserPresets.json
 
 # ignore build directories
+out/**
 build/**
 test_cpu/build/**
 test_gpu/build/**
+test_cpu/out/**
+test_gpu/out/**
 
 # ignore model directories
-models/**
+model/**
 model-hf/**
 test_cpu/models/**
 test_cpu/tokenizer/**
 test_gpu/models/**
 test_gpu/tokenizer/**
 
+# ignore venv
+venv/**
+
+.vs/
 .vscode/

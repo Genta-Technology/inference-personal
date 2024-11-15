@@ -9,11 +9,14 @@
 #include "llama.h"
 #include "common.h"
 #include "inference.h"
+#include "thread_pool.h"
 #ifdef USE_GPU
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #endif
+
+#define MAX_CONCURRENT_JOBS 4
 
 bool CompletionParameters::isValid() const
 {
@@ -33,7 +36,10 @@ bool ChatCompletionParameters::isValid() const
         minLength < 0 || minLength > 4096 ||
         temperature < 0.0f ||
         topP < 0.0f || topP > 1.0f)
+    {
         return false;
+    }
+
     for (const auto &message : messages)
     {
         if (message.role != "user" && message.role != "system" && message.role != "assistant")
@@ -58,11 +64,12 @@ namespace
     class Tokenizer
     {
     public:
-        Tokenizer(const std::string &modelPath);
+        Tokenizer(const std::string &modelPath, const gpt_params params);
         ~Tokenizer();
 
         std::vector<int32_t> tokenize(const std::string &text, bool add_bos = true);
         std::string detokenize(const std::vector<int32_t> &tokens);
+        std::string decode(const int32_t &token);
 
         llama_model *getModel() const { return tokenizer_model; }
         llama_context *getContext() const { return tokenizer_context; }
@@ -74,33 +81,29 @@ namespace
         bool add_bos;
     };
 
-    Tokenizer::Tokenizer(const std::string &modelPath)
+    Tokenizer::Tokenizer(const std::string &modelPath, const gpt_params params)
         : tokenizer_model(nullptr), tokenizer_context(nullptr), add_bos(false)
     {
-#ifdef DEBUG
-        llama_log_set(llama_log_callback_null, NULL);
-#endif
-        llama_backend_init();
-
         std::cout << "Loading tokenizer model from: " << modelPath << std::endl;
 
-        llama_model_params model_params = llama_model_default_params();
-        model_params.vocab_only = true;
-
+        llama_model_params model_params = llama_model_params_from_gpt_params(params);
+		model_params.vocab_only = true;
         tokenizer_model = llama_load_model_from_file(modelPath.c_str(), model_params);
-        if (!tokenizer_model)
+        if (tokenizer_model == NULL)
         {
-            throw std::runtime_error("Could not load tokenizer model");
+            throw std::runtime_error("Failed to load tokenizer from " + params.model);
         }
 
-        llama_context_params ctx_params = llama_context_default_params();
+        llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+        ctx_params.n_threads = GGML_DEFAULT_N_THREADS;
+        ctx_params.n_threads_batch = GGML_DEFAULT_N_THREADS;
         tokenizer_context = llama_new_context_with_model(tokenizer_model, ctx_params);
-        if (!tokenizer_context)
+        if (tokenizer_context == NULL)
         {
             throw std::runtime_error("Error: could not create tokenizer context.");
         }
 
-        add_bos = llama_should_add_bos_token(tokenizer_model);
+        add_bos = llama_add_bos_token(tokenizer_model);
     }
 
     Tokenizer::~Tokenizer()
@@ -120,10 +123,14 @@ namespace
         std::ostringstream tokensStream;
         for (const auto &token : tokens)
         {
-            std::string tokenStr = llama_token_to_piece(tokenizer_context, token);
-            tokensStream << tokenStr;
+            tokensStream << decode(token);
         }
         return tokensStream.str();
+    }
+
+    std::string Tokenizer::decode(const int32_t &token)
+    {
+		return llama_token_to_piece(tokenizer_context, token);
     }
 
     // InferenceService Interface (Internal Use Only)
@@ -139,32 +146,118 @@ namespace
     class CpuInferenceService : public InferenceService
     {
     public:
-        CpuInferenceService(std::shared_ptr<Tokenizer> tokenizer)
-            : tokenizer(std::move(tokenizer)) {}
+        CpuInferenceService(
+            std::shared_ptr<Tokenizer> tokenizer, 
+            llama_model* model, 
+            llama_context* context)
+            : tokenizer(std::move(tokenizer)),
+			  model(model),
+			  context(context)
+              {}
+
+		~CpuInferenceService()
+		{
+			llama_free(context);
+			llama_free_model(model);
+		}
 
         CompletionResult complete(const CompletionParameters &params) override
         {
-            std::cout << "Using CPU (Dummy) inference service." << std::endl;
+            std::lock_guard<std::mutex> lock(mtx);
 
             if (!params.isValid())
             {
                 throw std::invalid_argument("Invalid completion parameters");
             }
 
+            auto sparams = llama_sampler_chain_default_params();
+            sparams.no_perf = false;
+            llama_sampler* sampler = llama_sampler_chain_init(sparams);
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
+            llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.randomSeed));
+            llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params.topP, 1));
+            //llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params.topK));
+
             // Tokenize the prompt
             auto tokens = tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
 
-            // For demonstration, return the tokenized input as a string
-            std::string tokenizedText = tokenizer->detokenize(tokens);
+			const int n_ctx = llama_n_ctx(context);
+            const int n_kv_req = tokens.size() + (params.maxNewTokens - tokens.size());
+
+#ifdef DEBUG
+			std::cout << "Min length: " << params.minLength << std::endl;
+			std::cout << "n_ctx: " << n_ctx << std::endl;
+			std::cout << "n_kv_req: " << n_kv_req << std::endl;
+#endif
+
+			if (n_kv_req > n_ctx)
+			{
+				throw std::invalid_argument("The prompt is too long");
+			}
+
+            llama_batch batch = llama_batch_init(128, 0, 1);
+
+            for (size_t i = 0; i < tokens.size(); i++)
+            {
+                llama_batch_add(batch, tokens[i], i, { 0 }, false);
+            }
+
+            batch.logits[batch.n_tokens - 1] = true;
+
+            // TODO: GGML_ASSERT(n_threads > 0) failed \llama.cpp:16822
+            if (llama_decode(context, batch) != 0) {
+				throw std::runtime_error("Error: could not decode tokens.");
+            }
+
+            int n_cur = batch.n_tokens;
+            int n_decode = 0;
+			// hold the decoded tokens
+            std::ostringstream tokensStream;
+			std::vector<int> generatedTokens;
+
+            while (n_cur <= params.maxNewTokens)
+            {
+				// sample the next token
+                {
+                    const llama_token new_token_id = llama_sampler_sample(sampler, context, -1);
+
+					// if the new token is an end-of-sequence token or we have reached the maximum number of tokens
+					// we stop generating new tokens
+                    if (llama_token_is_eog(model, new_token_id) || n_cur == params.maxNewTokens)
+                    {
+                        break;
+                    }
+
+                    tokensStream << tokenizer->decode(new_token_id);
+					generatedTokens.push_back(new_token_id);
+
+                    // prepare the next batch
+                    llama_batch_clear(batch);
+
+                    // push this new token for next evaluation
+                    llama_batch_add(batch, new_token_id, n_cur, { 0 }, true);
+
+					n_decode++;
+                }
+
+				n_cur++;
+
+                // evaluate the current batch with the transformer model
+                if (llama_decode(context, batch)) {
+					throw std::runtime_error("Error: could not decode tokens.");
+                }
+            }
+
+            llama_batch_free(batch);
+			llama_sampler_free(sampler);
 
             // Create a dummy response (e.g., echo the tokenized prompt)
-            return {tokens, tokenizedText};
+            return {generatedTokens, tokensStream.str()};
         }
 
         CompletionResult chatComplete(const ChatCompletionParameters &params) override
         {
-            std::cout << "Using CPU (Dummy) inference service." << std::endl;
-
             if (!params.isValid())
             {
                 throw std::invalid_argument("Invalid chat completion parameters");
@@ -188,6 +281,7 @@ namespace
                 buf.data(),
                 buf.size());
 
+			// If the buffer is too small, resize and re-apply the template
             if (ret_val > static_cast<int32_t>(buf.size()))
             {
                 buf.resize(ret_val);
@@ -203,7 +297,6 @@ namespace
 
             std::string formattedChat(buf.data(), ret_val);
 
-            // Tokenize the formatted chat
             CompletionParameters completionParams{
                 formattedChat,
                 params.randomSeed,
@@ -218,6 +311,9 @@ namespace
 
     private:
         std::shared_ptr<Tokenizer> tokenizer;
+        llama_model* model;
+        llama_context* context;
+        std::mutex mtx;
     };
 
 #ifdef USE_GPU
@@ -279,8 +375,6 @@ namespace
 
         CompletionResult chatComplete(const ChatCompletionParameters &params) override
         {
-            std::lock_guard<std::mutex> lock(mtx);
-
             if (!params.isValid())
             {
                 throw std::invalid_argument("Invalid chat completion parameters");
@@ -345,23 +439,31 @@ struct InferenceEngine::Impl
     std::unique_ptr<InferenceService> inferenceService;
     bool use_gpu;
 
-    Impl(const std::string &engineDir, bool use_gpu);
+    // Job management members
+    std::atomic<int> nextJobId{ 1 };
+    std::unordered_map<int, std::future<CompletionResult>> jobs;
+    std::mutex jobsMutex;
+
+    ThreadPool threadPool;
+
+    Impl(const std::string &engineDir, bool use_gpu, size_t max_concurrent_requests);
     ~Impl();
 
-    CompletionResult complete(const CompletionParameters &params)
-    {
-        return inferenceService->complete(params);
-    }
-
-    CompletionResult chatComplete(const ChatCompletionParameters &params)
-    {
-        return inferenceService->chatComplete(params);
-    }
+    int submitCompleteJob(const CompletionParameters& params);
+    int submitChatCompleteJob(const ChatCompletionParameters& params);
+    bool isJobFinished(int job_id);
+    CompletionResult getJobResult(int job_id);
+    void waitForJob(int job_id);
 };
 
-InferenceEngine::Impl::Impl(const std::string &engineDir, bool use_gpu)
-    : use_gpu(use_gpu)
+InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu, size_t max_concurrent_requests)
+    : use_gpu(use_gpu), threadPool(max_concurrent_requests)
 {
+#ifdef DEBUG
+#else
+    llama_log_set(llama_log_callback_null, NULL);
+#endif
+
 #ifdef USE_GPU
     std::filesystem::path tokenizer_model_path = std::filesystem::path(engineDir) / "tokenizer.gguf";
 #else
@@ -382,8 +484,16 @@ InferenceEngine::Impl::Impl(const std::string &engineDir, bool use_gpu)
         throw std::runtime_error("Tokenizer model not found from" + tokenizer_model_path.string());
     }
 
+    gpt_params params;
+    params.model = tokenizer_model_path.string().c_str();
+    params.n_ctx = 8192;
+    params.n_predict = 4096;
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
     // Initialize the tokenizer
-    auto tokenizer = std::make_shared<Tokenizer>(tokenizer_model_path.string());
+    auto tokenizer = std::make_shared<Tokenizer>(tokenizer_model_path.string(), params);
 
     if (use_gpu)
     {
@@ -431,7 +541,7 @@ InferenceEngine::Impl::Impl(const std::string &engineDir, bool use_gpu)
 
 #else
         // If USE_GPU is not defined but GPU is available, notify the user.
-        std::cerr << "GPU is available but the application was not compiled with GPU support." << std::endl;
+        std::cerr << "GPU is available but the library was not compiled with GPU support." << std::endl;
         use_gpu = false;
 #endif
     }
@@ -440,28 +550,158 @@ InferenceEngine::Impl::Impl(const std::string &engineDir, bool use_gpu)
     {
         // Initialize CPU inference if GPU is not available
         std::cout << "GPU not detected or not usable. Falling back to CPU inference." << std::endl;
-        inferenceService = std::make_unique<CpuInferenceService>(tokenizer);
+		std::cout << "Loading model from " << tokenizer_model_path << std::endl;
+
+        llama_model_params model_params = llama_model_params_from_gpt_params(params);
+        llama_model* model = llama_load_model_from_file(params.model.c_str(), model_params);
+		if (model == NULL)
+		{
+			throw std::runtime_error("Failed to load model from " + params.model);
+		}
+
+        llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+        ctx_params.n_threads = GGML_DEFAULT_N_THREADS;
+        ctx_params.n_threads_batch = GGML_DEFAULT_N_THREADS;
+        llama_context* ctx = llama_new_context_with_model(model, ctx_params);
+		if (ctx == NULL)
+		{
+			throw std::runtime_error("Failed to create context with model");
+		}
+
+        inferenceService = std::make_unique<CpuInferenceService>(tokenizer, model, ctx);
     }
+}
+
+int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params) 
+{
+    int jobId = nextJobId++;
+
+    // Asynchronously execute the job using thread pool
+    auto task = [this, params]() {
+        return this->inferenceService->complete(params);
+        };
+
+    std::future<CompletionResult> futureResult = threadPool.enqueue(task);
+
+    // Store the future in the jobs map
+    {
+        std::lock_guard<std::mutex> lock(jobsMutex);
+        jobs.emplace(jobId, std::move(futureResult));
+    }
+
+    return jobId;
+}
+
+int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters& params) 
+{
+    int jobId = nextJobId++;
+
+    // Asynchronously execute the job using thread pool
+    auto task = [this, params]() {
+        return this->inferenceService->chatComplete(params);
+        };
+
+    std::future<CompletionResult> futureResult = threadPool.enqueue(task);
+
+    // Store the future in the jobs map
+    {
+        std::lock_guard<std::mutex> lock(jobsMutex);
+        jobs.emplace(jobId, std::move(futureResult));
+    }
+
+    return jobId;
+}
+
+bool InferenceEngine::Impl::isJobFinished(int job_id) 
+{
+    std::lock_guard<std::mutex> lock(jobsMutex);
+
+    auto it = jobs.find(job_id);
+    if (it == jobs.end()) {
+        throw std::invalid_argument("Invalid job ID");
+    }
+
+    auto& futureResult = it->second;
+    return futureResult.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
+CompletionResult InferenceEngine::Impl::getJobResult(int job_id) 
+{
+    std::future<CompletionResult> futureResult;
+
+    {
+        std::lock_guard<std::mutex> lock(jobsMutex);
+
+        auto it = jobs.find(job_id);
+        if (it == jobs.end()) {
+            throw std::invalid_argument("Invalid job ID");
+        }
+
+        // Check if the future is ready
+        if (it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            throw std::runtime_error("Job " + std::to_string(job_id) + " is not finished yet");
+        }
+
+        futureResult = std::move(it->second);
+        jobs.erase(it); // Remove job from map after retrieving result
+    }
+
+    return futureResult.get();
+}
+
+void InferenceEngine::Impl::waitForJob(int job_id) 
+{
+    std::future<CompletionResult>* futureResultPtr = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(jobsMutex);
+
+        auto it = jobs.find(job_id);
+        if (it == jobs.end()) 
+        {
+            throw std::invalid_argument("Invalid job ID");
+        }
+
+        futureResultPtr = &it->second;
+    }
+
+    futureResultPtr->wait();
 }
 
 InferenceEngine::Impl::~Impl()
 {
-    // Resources are cleaned up by destructors
+    threadPool.shutdown();
+    llama_backend_free();
 }
 
-InferenceEngine::InferenceEngine(const std::string &engineDir)
-    : pimpl(std::make_unique<Impl>(engineDir, isGpuAvailable()))
+InferenceEngine::InferenceEngine(const std::string& engineDir)
+    : pimpl(std::make_unique<Impl>(engineDir, isGpuAvailable(), MAX_CONCURRENT_JOBS))
 {
 }
 
-CompletionResult InferenceEngine::complete(const CompletionParameters &params)
+int InferenceEngine::submitCompleteJob(const CompletionParameters& params) 
 {
-    return pimpl->complete(params);
+    return pimpl->submitCompleteJob(params);
 }
 
-CompletionResult InferenceEngine::chatComplete(const ChatCompletionParameters &params)
+int InferenceEngine::submitChatCompleteJob(const ChatCompletionParameters& params) 
 {
-    return pimpl->chatComplete(params);
+    return pimpl->submitChatCompleteJob(params);
+}
+
+bool InferenceEngine::isJobFinished(int job_id) 
+{
+    return pimpl->isJobFinished(job_id);
+}
+
+CompletionResult InferenceEngine::getJobResult(int job_id) 
+{
+    return pimpl->getJobResult(job_id);
+}
+
+void InferenceEngine::waitForJob(int job_id) 
+{
+    pimpl->waitForJob(job_id);
 }
 
 InferenceEngine::~InferenceEngine() = default;

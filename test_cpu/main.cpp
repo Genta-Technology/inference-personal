@@ -1,5 +1,6 @@
 #include "inference.h"
 #include <iostream>
+#include <chrono>
 
 int main(int argc, char *argv[])
 {
@@ -20,10 +21,18 @@ int main(int argc, char *argv[])
         params.prompt = "Hello, how are you?";
 
         // Perform text completion
-        auto result = engine.complete(params);
+        auto start = std::chrono::high_resolution_clock::now();
+        int jobId = engine.submitCompleteJob(params);
+        engine.waitForJob(jobId);
+        CompletionResult result = engine.getJobResult(jobId);
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> duration = end - start;
 
         // Output the completion result
-        std::cout << "CPU Completion Result: " << result.text << std::endl;
+        std::cout << "\n\nCPU Completion Result: " << result.text << std::endl;
+        std::cout << "Time taken for text completion: " << duration.count() << " seconds" << std::endl;
+		std::cout << "Tokens: " << result.tokens.size() << std::endl;
+		std::cout << "-----------------------------------------------------------------------------\n";
 
         // Prepare chat completion parameters
         ChatCompletionParameters chatParams;
@@ -31,10 +40,17 @@ int main(int argc, char *argv[])
             {"user", "Tell me a joke."}};
 
         // Perform chat completion
-        auto chatResult = engine.chatComplete(chatParams);
+        auto chatStart = std::chrono::high_resolution_clock::now();
+        int chatJobId = engine.submitChatCompleteJob(chatParams);
+        engine.waitForJob(chatJobId);
+        CompletionResult chatResult = engine.getJobResult(chatJobId);
+        auto chatEnd = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> chatDuration = chatEnd - chatStart;
 
         // Output the chat completion result
-        std::cout << "CPU Chat Completion Result: " << chatResult.text << std::endl;
+        std::cout << "\n\nCPU Chat Completion Result: " << chatResult.text << std::endl;
+        std::cout << "Time taken for chat completion: " << chatDuration.count() << " seconds" << std::endl;
+        std::cout << "Tokens: " << chatResult.tokens.size() << std::endl;
     }
     catch (const std::exception &e)
     {
