@@ -19,6 +19,7 @@ target_include_directories(TestInferenceEngineCPU PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../external/llama.cpp/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../external/llama.cpp/common
     ${CMAKE_CURRENT_SOURCE_DIR}/../external/llama.cpp/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../external/openssl/include
 )
 
 # Set the library paths

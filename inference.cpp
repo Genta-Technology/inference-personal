@@ -1,7 +1,12 @@
 #include <filesystem>
 #include <stdexcept>
 #include <iostream>
-#include <mutex>
+#include <queue>
+#include <cstdint>
+#include <thread>
+#include <condition_variable>
+#include <functional>
+#include <type_traits>
 #ifdef USE_GPU
 #include <cuda_runtime.h>
 #endif
@@ -9,7 +14,6 @@
 #include "llama.h"
 #include "common.h"
 #include "inference.h"
-#include "thread_pool.h"
 #include "job.h"
 #ifdef USE_GPU
 #include "tensorrt_llm/executor/executor.h"
@@ -17,7 +21,133 @@
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #endif
 
-#define MAX_CONCURRENT_JOBS 4
+#define JOBS_SEED "[p(Pe6lSXKBO?edB`3cne4W,&RLcZ'S{2{Au*/o<?^!sca_JF?+Q-6g]/<F,P(U\\d\\t8+FcxD/DuM/\"G_v`<mN0Z`Pf&QX?;Y,k;ih,dB>EGLm0ua$o04,b5Gy(N(8Os@8}@_^J2xk=~ozG2\"BA)\\L^Ug|QyvR6b:\\PQZ71ZN@H$$lgi\"G3!>[saZ.#9]H$Hd\"Q7XE$S7aZLZsfEO9DU&<t85\"ot[er{}SlDzp~,@@p/hm83M+$?&Q5,KwW,Q?!a"
+
+class ThreadPool {
+public:
+	explicit ThreadPool();
+	~ThreadPool();
+
+	// Submit a task to the thread pool
+	template<class F, class... Args>
+	auto enqueue(F&& f, Args&&... args)
+		-> std::future<typename std::invoke_result<F, Args...>::type>;
+
+	// Shutdown the thread pool
+	void shutdown();
+
+private:
+	// Worker function for each thread
+	void worker();
+
+	// Members
+	std::vector<std::thread> workers;
+	std::queue<std::function<void()>> tasks;
+
+	// Synchronization
+	std::mutex queue_mutex;
+	std::condition_variable condition;
+	bool stop;
+};
+
+//-------------------------------------------------------------------------------------------------
+// Thread Pool function definitions
+//-------------------------------------------------------------------------------------------------
+
+inline ThreadPool::ThreadPool() : stop(false)
+{
+	std::string seed = JOBS_SEED;
+	uint32_t hash = 0;
+	for (char c : seed) {
+		hash = (hash * 131 + (unsigned char)c) % (1ULL << 32);
+	}
+
+	size_t num_threads = hash % 10;
+
+#ifdef DEBUG
+	std::cout << "Creating thread pool with " << num_threads << " threads" << std::endl;
+#endif
+
+	for (size_t i = 0; i < num_threads; ++i)
+	{
+		workers.emplace_back(&ThreadPool::worker, this);
+	}
+}
+
+inline ThreadPool::~ThreadPool()
+{
+	shutdown();
+}
+
+inline void ThreadPool::shutdown()
+{
+	{
+		std::unique_lock<std::mutex> lock(queue_mutex);
+		stop = true;
+	}
+	condition.notify_all();
+	for (std::thread& worker : workers)
+	{
+		if (worker.joinable())
+		{
+			worker.join();
+		}
+	}
+}
+
+inline void ThreadPool::worker()
+{
+	while (true)
+	{
+		std::function<void()> task;
+
+		{
+			std::unique_lock<std::mutex> lock(this->queue_mutex);
+
+			this->condition.wait(lock, [this] {
+				return this->stop || !this->tasks.empty();
+				});
+
+			if (this->stop && this->tasks.empty())
+			{
+				return;
+			}
+
+			task = std::move(this->tasks.front());
+			this->tasks.pop();
+		}
+
+		task();
+	}
+}
+
+template<class F, class... Args>
+auto ThreadPool::enqueue(F&& f, Args&&... args)
+-> std::future<typename std::invoke_result<F, Args...>::type>
+{
+	using return_type = typename std::invoke_result<F, Args...>::type;
+
+	auto task_ptr = std::make_shared<std::packaged_task<return_type()>>(
+		std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+	);
+
+	std::future<return_type> res = task_ptr->get_future();
+
+	{
+		std::unique_lock<std::mutex> lock(queue_mutex);
+
+		// Don't allow enqueueing after stopping the pool
+		if (stop)
+		{
+			throw std::runtime_error("enqueue on stopped ThreadPool");
+		}
+
+		tasks.emplace([task_ptr]() { (*task_ptr)(); });
+	}
+
+	condition.notify_one();
+	return res;
+}
 
 bool CompletionParameters::isValid() const
 {
@@ -165,7 +295,6 @@ namespace
 
 		void complete(const CompletionParameters& params, std::shared_ptr<Job> job) override
 		{
-			// TODO: this mutex prevent any other job from running in parallel
 			std::lock_guard<std::mutex> lock(mtx);
 
 			if (!params.isValid())
@@ -512,7 +641,7 @@ struct InferenceEngine::Impl
 
 	ThreadPool threadPool;
 
-	Impl(const std::string& engineDir, bool use_gpu, size_t max_concurrent_requests);
+	Impl(const std::string& engineDir, bool use_gpu);
 	~Impl();
 
 	int submitCompleteJob(const CompletionParameters& params);
@@ -524,8 +653,8 @@ struct InferenceEngine::Impl
 	std::string getJobError(int job_id);
 };
 
-InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu, size_t max_concurrent_requests)
-	: use_gpu(use_gpu), threadPool(max_concurrent_requests)
+InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu)
+	: use_gpu(use_gpu), threadPool()
 {
 #ifdef DEBUG
 #else
@@ -786,7 +915,7 @@ InferenceEngine::Impl::~Impl()
 }
 
 InferenceEngine::InferenceEngine(const std::string& engineDir)
-	: pimpl(std::make_unique<Impl>(engineDir, isGpuAvailable(), MAX_CONCURRENT_JOBS))
+	: pimpl(std::make_unique<Impl>(engineDir, isGpuAvailable()))
 {
 }
 
