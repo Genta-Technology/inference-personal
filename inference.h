@@ -103,10 +103,10 @@ public:
 	bool isJobFinished(int job_id);
 
 	/**
-	 * @brief Gets the result of a finished job.
+	 * @brief Gets the current result of a job.
 	 * @param job_id The ID of the job to get the result for.
 	 * @return The result of the job.
-	 * @note This function should only be called if isJobFinished returns true.
+	 * @note This function would return any results that are currently available, even if the job is not finished.
 	 */
 	CompletionResult getJobResult(int job_id);
 
@@ -115,6 +115,20 @@ public:
 	 * @param job_id The ID of the job to wait for.
 	 */
 	void waitForJob(int job_id);
+
+	/**
+	 * @brief Checks if a job has an error.
+	 * @param job_id The ID of the job to check.
+	 * @return True if the job has an error, false otherwise.
+	 */
+	bool hasJobError(int job_id);
+
+	/**
+	 * @brief Gets the error message for a job.
+	 * @param job_id The ID of the job to get the error message for.
+	 * @return The error message for the job.
+	 */
+	std::string getJobError(int job_id);
 
 	/**
 	 * @brief Destructor for the InferenceEngine.

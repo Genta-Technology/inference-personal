@@ -16,6 +16,7 @@ set(SOURCES
 # Header files (optional, but useful for IDEs)
 set(HEADERS
   thread_pool.h
+  job.h
 )
 
 # Create the library target

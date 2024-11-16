@@ -10,6 +10,7 @@
 #include "common.h"
 #include "inference.h"
 #include "thread_pool.h"
+#include "job.h"
 #ifdef USE_GPU
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/common/logger.h"
@@ -138,8 +139,8 @@ namespace
 	{
 	public:
 		virtual ~InferenceService() {}
-		virtual CompletionResult complete(const CompletionParameters& params) = 0;
-		virtual CompletionResult chatComplete(const ChatCompletionParameters& params) = 0;
+		virtual void complete(const CompletionParameters& params, std::shared_ptr<Job> job) = 0;
+		virtual void chatComplete(const ChatCompletionParameters& params, std::shared_ptr<Job> job) = 0;
 	};
 
 	// CpuInferenceService (CPU Implementation)
@@ -162,13 +163,18 @@ namespace
 			llama_free_model(model);
 		}
 
-		CompletionResult complete(const CompletionParameters& params) override
+		void complete(const CompletionParameters& params, std::shared_ptr<Job> job) override
 		{
+			// TODO: this mutex prevent any other job from running in parallel
 			std::lock_guard<std::mutex> lock(mtx);
 
 			if (!params.isValid())
 			{
-				throw std::invalid_argument("Invalid completion parameters");
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = "Invalid completion parameters";
+				job->cv.notify_all();
+				return;
 			}
 
 			auto sparams = llama_sampler_chain_default_params();
@@ -179,6 +185,11 @@ namespace
 			llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.randomSeed));
 			llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params.topP, 1));
 			//llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params.topK));
+
+			{
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->generatedTokens.clear();
+			}
 
 			// Tokenize the prompt
 			auto tokens = tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
@@ -194,7 +205,12 @@ namespace
 
 			if (n_kv_req > n_ctx)
 			{
-				throw std::invalid_argument("The prompt is too long");
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = "The prompt is too long";
+				job->cv.notify_all();
+				llama_sampler_free(sampler);
+				return;
 			}
 
 			llama_batch batch = llama_batch_init(128, 0, 1);
@@ -206,17 +222,19 @@ namespace
 
 			batch.logits[batch.n_tokens - 1] = true;
 
-			// TODO: GGML_ASSERT(n_threads > 0) failed \llama.cpp:16822
 			if (llama_decode(context, batch) != 0) 
 			{
-				throw std::runtime_error("Error: could not decode tokens.");
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = "Could not decode tokens.";
+				job->cv.notify_all();
+				llama_batch_free(batch);
+				llama_sampler_free(sampler);
+				return;
 			}
 
 			int n_cur = batch.n_tokens;
 			int n_decode = 0;
-			// hold the decoded tokens
-			std::ostringstream tokensStream;
-			std::vector<int> generatedTokens;
 
 			while (n_cur <= params.maxNewTokens)
 			{
@@ -231,8 +249,14 @@ namespace
 						break;
 					}
 
-					tokensStream << tokenizer->decode(new_token_id);
-					generatedTokens.push_back(new_token_id);
+					std::string tokenText = tokenizer->decode(new_token_id);
+
+					{
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->generatedTokens.push_back(new_token_id);
+						job->generatedText += tokenText;
+						job->cv.notify_all();
+					}
 
 					// prepare the next batch
 					llama_batch_clear(batch);
@@ -247,18 +271,25 @@ namespace
 
 				// evaluate the current batch with the transformer model
 				if (llama_decode(context, batch)) {
-					throw std::runtime_error("Error: could not decode tokens.");
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->hasError = true;
+					job->errorMessage = "Could not decode tokens.";
+					job->cv.notify_all();
+					break;
 				}
 			}
 
 			llama_batch_free(batch);
 			llama_sampler_free(sampler);
 
-			// Create a dummy response (e.g., echo the tokenized prompt)
-			return { generatedTokens, tokensStream.str() };
+			{
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->isFinished = true;
+				job->cv.notify_all();
+			}
 		}
 
-		CompletionResult chatComplete(const ChatCompletionParameters& params) override
+		void chatComplete(const ChatCompletionParameters& params, std::shared_ptr<Job> job) override
 		{
 			if (!params.isValid())
 			{
@@ -308,7 +339,7 @@ namespace
 				params.topP,
 				params.streaming };
 
-			return complete(completionParams);
+			complete(completionParams, job);
 		}
 
 	private:
@@ -328,7 +359,7 @@ namespace
 			std::shared_ptr<tensorrt_llm::executor::Executor> executor,
 			std::shared_ptr<Tokenizer> tokenizer)
 			: executor(std::move(executor)),
-			tokenizer(std::move(tokenizer))
+			  tokenizer(std::move(tokenizer))
 		{
 		}
 
@@ -337,13 +368,22 @@ namespace
 			// Resources are cleaned up by shared pointers and destructors
 		}
 
-		CompletionResult complete(const CompletionParameters& params) override
+		void complete(const CompletionParameters& params, std::shared_ptr<Job> job) override
 		{
 			std::lock_guard<std::mutex> lock(mtx);
 
 			if (!params.isValid())
 			{
-				throw std::invalid_argument("Invalid completion parameters");
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = "Invalid completion parameters";
+				job->cv.notify_all();
+				return;
+			}
+
+			{
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->generatedTokens.clear();
 			}
 
 			// Tokenize the prompt
@@ -358,24 +398,48 @@ namespace
 			request.setEndId(llama_token_eos(tokenizer->getModel()));
 			request.setPadId(llama_token_pad(tokenizer->getModel()));
 
+			// Generate tokens
 			auto requestId = executor->enqueueRequest(request);
-			auto responses = executor->awaitResponses(requestId);
-			auto response = responses.at(0);
-
-			if (!response.hasError())
+			bool isFinished = false;
+			while (!isFinished)
 			{
-				auto outputTokens = response.getResult().outputTokenIds.at(0);
-				std::string outputText = tokenizer->detokenize(outputTokens);
+				std::vector<tensorrt_llm::executor::Response> responses;
+				while (responses.empty())
+				{
+					responses = executor->awaitResponses(requestId, std::chrono::milliseconds(100));
+				}
+				auto response = responses.at(0);
 
-				return { outputTokens, outputText };
+				if (response.hasError())
+				{
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->hasError = true;
+					job->errorMessage = response.getErrorMsg();
+					job->cv.notify_all();
+					break;
+				}
+
+				auto result = response.getResult();
+				isFinished = result.isFinal;
+
+				std::string generatedText = tokenizer->detokenize(result.outputTokenIds.at(0));
+
+				{
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->generatedTokens.insert(job->generatedTokens.end(), result.outputTokenIds.begin(), result.outputTokenIds.at(0).end());
+					job->generatedText += generatedText;
+					job->cv.notify_all();
+				}
 			}
-			else
+
 			{
-				throw std::runtime_error(response.getErrorMsg());
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->isFinished = true;
+				job->cv.notify_all();
 			}
 		}
 
-		CompletionResult chatComplete(const ChatCompletionParameters& params) override
+		void chatComplete(const ChatCompletionParameters& params, std::shared_ptr<Job> job) override
 		{
 			if (!params.isValid())
 			{
@@ -423,7 +487,7 @@ namespace
 				params.topP,
 				params.streaming };
 
-			return complete(completionParams);
+			complete(completionParams, job);
 		}
 
 	private:
@@ -443,7 +507,7 @@ struct InferenceEngine::Impl
 
 	// Job management members
 	std::atomic<int> nextJobId{ 1 };
-	std::unordered_map<int, std::future<CompletionResult>> jobs;
+	std::unordered_map<int, std::shared_ptr<Job>> jobs;
 	std::mutex jobsMutex;
 
 	ThreadPool threadPool;
@@ -456,6 +520,8 @@ struct InferenceEngine::Impl
 	bool isJobFinished(int job_id);
 	CompletionResult getJobResult(int job_id);
 	void waitForJob(int job_id);
+	bool hasJobError(int job_id);
+	std::string getJobError(int job_id);
 };
 
 InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu, size_t max_concurrent_requests)
@@ -574,100 +640,143 @@ InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu, size_t m
 	}
 }
 
-int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params)
+int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params) 
 {
 	int jobId = nextJobId++;
 
+	auto job = std::make_shared<Job>();
+	job->jobId = jobId;
+
 	// Asynchronously execute the job using thread pool
-	auto task = [this, params]() {
-		return this->inferenceService->complete(params);
-		};
+	threadPool.enqueue([this, params, job]() {
+		try {
+			this->inferenceService->complete(params, job);
+		}
+		catch (const std::exception& e) {
+			std::lock_guard<std::mutex> lock(job->mtx);
+			job->hasError = true;
+			job->errorMessage = e.what();
+		}
+		});
 
-	std::future<CompletionResult> futureResult = threadPool.enqueue(task);
-
-	// Store the future in the jobs map
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
-		jobs.emplace(jobId, std::move(futureResult));
+		jobs.emplace(jobId, job);
 	}
 
 	return jobId;
 }
 
-int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters& params)
+int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters& params) 
 {
 	int jobId = nextJobId++;
 
+	auto job = std::make_shared<Job>();
+	job->jobId = jobId;
+
 	// Asynchronously execute the job using thread pool
-	auto task = [this, params]() {
-		return this->inferenceService->chatComplete(params);
-		};
+	threadPool.enqueue([this, params, job]() {
+		try {
+			this->inferenceService->chatComplete(params, job);
+		}
+		catch (const std::exception& e) {
+			std::lock_guard<std::mutex> lock(job->mtx);
+			job->hasError = true;
+			job->errorMessage = e.what();
+		}
+		});
 
-	std::future<CompletionResult> futureResult = threadPool.enqueue(task);
-
-	// Store the future in the jobs map
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
-		jobs.emplace(jobId, std::move(futureResult));
+		jobs.emplace(jobId, job);
 	}
 
 	return jobId;
 }
 
-bool InferenceEngine::Impl::isJobFinished(int job_id)
+bool InferenceEngine::Impl::isJobFinished(int job_id) 
 {
-	std::lock_guard<std::mutex> lock(jobsMutex);
-
-	auto it = jobs.find(job_id);
-	if (it == jobs.end()) {
-		throw std::invalid_argument("Invalid job ID");
-	}
-
-	auto& futureResult = it->second;
-	return futureResult.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-}
-
-CompletionResult InferenceEngine::Impl::getJobResult(int job_id)
-{
-	std::future<CompletionResult> futureResult;
+	std::shared_ptr<Job> job;
 
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
-
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) {
 			throw std::invalid_argument("Invalid job ID");
 		}
-
-		// Check if the future is ready
-		if (it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-			throw std::runtime_error("Job " + std::to_string(job_id) + " is not finished yet");
-		}
-
-		futureResult = std::move(it->second);
-		jobs.erase(it); // Remove job from map after retrieving result
+		job = it->second;
 	}
 
-	return futureResult.get();
+	std::lock_guard<std::mutex> jobLock(job->mtx);
+	return job->isFinished;
 }
 
-void InferenceEngine::Impl::waitForJob(int job_id)
+CompletionResult InferenceEngine::Impl::getJobResult(int job_id)
 {
-	std::future<CompletionResult>* futureResultPtr = nullptr;
+	std::shared_ptr<Job> job;
 
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
-
 		auto it = jobs.find(job_id);
-		if (it == jobs.end())
-		{
+		if (it == jobs.end()) {
 			throw std::invalid_argument("Invalid job ID");
 		}
-
-		futureResultPtr = &it->second;
+		job = it->second;
 	}
 
-	futureResultPtr->wait();
+	std::lock_guard<std::mutex> jobLock(job->mtx);
+	return { job->generatedTokens, job->generatedText };
+}
+
+void InferenceEngine::Impl::waitForJob(int job_id) 
+{
+	std::shared_ptr<Job> job;
+
+	{
+		std::lock_guard<std::mutex> lock(jobsMutex);
+		auto it = jobs.find(job_id);
+		if (it == jobs.end()) {
+			throw std::invalid_argument("Invalid job ID");
+		}
+		job = it->second;
+	}
+
+	std::unique_lock<std::mutex> jobLock(job->mtx);
+	job->cv.wait(jobLock, [&job]() { return job->isFinished || job->hasError; });
+}
+
+bool InferenceEngine::Impl::hasJobError(int job_id) 
+{
+	std::shared_ptr<Job> job;
+
+	{
+		std::lock_guard<std::mutex> lock(jobsMutex);
+		auto it = jobs.find(job_id);
+		if (it == jobs.end()) {
+			throw std::invalid_argument("Invalid job ID");
+		}
+		job = it->second;
+	}
+
+	std::lock_guard<std::mutex> jobLock(job->mtx);
+	return job->hasError;
+}
+
+std::string InferenceEngine::Impl::getJobError(int job_id) 
+{
+	std::shared_ptr<Job> job;
+
+	{
+		std::lock_guard<std::mutex> lock(jobsMutex);
+		auto it = jobs.find(job_id);
+		if (it == jobs.end()) {
+			throw std::invalid_argument("Invalid job ID");
+		}
+		job = it->second;
+	}
+
+	std::lock_guard<std::mutex> jobLock(job->mtx);
+	return job->errorMessage;
 }
 
 InferenceEngine::Impl::~Impl()
@@ -704,6 +813,16 @@ CompletionResult InferenceEngine::getJobResult(int job_id)
 void InferenceEngine::waitForJob(int job_id)
 {
 	pimpl->waitForJob(job_id);
+}
+
+bool InferenceEngine::hasJobError(int job_id)
+{
+	return pimpl->hasJobError(job_id);
+}
+
+std::string InferenceEngine::getJobError(int job_id)
+{
+	return pimpl->getJobError(job_id);
 }
 
 InferenceEngine::~InferenceEngine() = default;
