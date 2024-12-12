@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.14)
 project(InferenceEngine)
 
 # Options
-option(USE_GPU "Compile with GPU support (CUDA and TensorRT)" OFF)
+option(USE_CUDA   "Compile with CUDA support" OFF)
+option(USE_VULKAN "Compile with VULKAN support" OFF)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -49,59 +50,6 @@ else()
   )
 endif()
 
-# Handle USE_GPU option
-if(USE_GPU)
-  message(STATUS "Compiling with GPU support (USE_GPU is ON)")
-  target_compile_definitions(InferenceEngineLib PUBLIC USE_GPU)
-
-  # Find CUDA
-  find_package(CUDA REQUIRED)
-  if(NOT CUDA_FOUND)
-    message(FATAL_ERROR "CUDA not found. Please install CUDA or disable USE_GPU.")
-  else()
-    message(STATUS "CUDA found: version ${CUDA_VERSION}")
-  endif()
-
-  # Find TensorRT
-  if(WIN32)
-    # Windows-specific TensorRT paths
-    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-      HINTS "$ENV{TRT_DIR}/include"
-            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.0/include"
-            "C:/Program Files/NVIDIA Corporation/TensorRT/include"
-      DOC "TensorRT include directory"
-    )
-    find_library(TENSORRT_LIBRARY nvinfer
-      HINTS "$ENV{TRT_DIR}/lib"
-            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.0/lib/x64"
-            "C:/Program Files/NVIDIA Corporation/TensorRT/lib"
-      DOC "TensorRT library"
-    )
-  else()
-    # UNIX-specific TensorRT paths
-    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-      HINTS /usr/include /usr/local/include
-      DOC "TensorRT include directory"
-    )
-    find_library(TENSORRT_LIBRARY nvinfer
-      HINTS /usr/lib /usr/local/lib
-      DOC "TensorRT library"
-    )
-  endif()
-
-  if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_LIBRARY)
-    message(FATAL_ERROR "TensorRT not found. Please install TensorRT or disable USE_GPU.")
-  else()
-    message(STATUS "TensorRT found")
-  endif()
-
-  # Include directories and libraries
-  target_include_directories(InferenceEngineLib PUBLIC ${CUDA_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR})
-  target_link_libraries(InferenceEngineLib PUBLIC ${CUDA_LIBRARIES} ${TENSORRT_LIBRARY})
-else()
-  message(STATUS "Compiling without GPU support (USE_GPU is OFF)")
-endif()
-
 # Find llama.cpp library
 set(LLAMA_CPP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp")
 if(NOT EXISTS "${LLAMA_CPP_PATH}/CMakeLists.txt")
@@ -113,17 +61,36 @@ set(LLAMA_BUILD_TESTS     OFF CACHE BOOL "Disable llama.cpp tests"        FORCE)
 set(LLAMA_BUILD_EXAMPLES  OFF CACHE BOOL "Disable llama.cpp examples"     FORCE)
 set(LLAMA_BUILD_SERVER    OFF CACHE BOOL "Disable llama.cpp server"       FORCE)
 set(LLAMA_ALL_WARNINGS    OFF CACHE BOOL "Disable warnings in llama.cpp"  FORCE)
+set(GGML_BLAS             ON  CACHE BOOL "Enable GGML BLAS support"       FORCE)
 
-# Enable GGML CUDA support if USE_GPU is ON
-if(USE_GPU)
-  set(GGML_CUDA ON CACHE BOOL "Enable GGML CUDA support" FORCE)
+# Build llama.cpp as a static library
+set(BUILD_SHARED_LIBS	  OFF CACHE BOOL "Build llama.cpp as a static lib" FORCE)
+set(GGML_STATIC_LINK      ON  CACHE BOOL "Static link ggml libraries"      FORCE)
+set(GGML_STATIC           ON  CACHE BOOL "Static link ggml libraries"      FORCE)
+
+# Enable GGML acceleration
+if(USE_CUDA)
+  set(GGML_CUDA     ON CACHE BOOL "Enable GGML CUDA support"       FORCE)
+  message(STATUS "Using CUDA for GGML acceleration")
+elseif(USE_VULKAN)
+  set(GGML_VULKAN   ON CACHE BOOL "Enable GGML Vulkan support"     FORCE)
+  message(STATUS "Using ROCm for GGML acceleration")
+else()
+  set(GGML_OPENBLAS ON CACHE BOOL "Enable GGML OpenBLAS support"   FORCE)
+  message(STATUS "Using OpenBLAS for GGML acceleration")
 endif()
+
+# define USE_CUDA and USE_VULKAN for inference.cpp
+target_compile_definitions(InferenceEngineLib PUBLIC
+  $<$<BOOL:${USE_CUDA}>:USE_CUDA>
+  $<$<BOOL:${USE_VULKAN}>:USE_VULKAN>
+)
 
 # Add llama.cpp subdirectory
 add_subdirectory(${LLAMA_CPP_PATH})
 
 # Link llama.cpp library
-target_link_libraries(InferenceEngineLib PUBLIC llama)
+target_link_libraries(InferenceEngineLib PRIVATE llama)
 
 # Include directories for InferenceEngineLib
 target_include_directories(InferenceEngineLib PUBLIC

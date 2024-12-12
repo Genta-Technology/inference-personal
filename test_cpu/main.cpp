@@ -19,27 +19,12 @@ int main(int argc, char* argv[])
 		// Prepare chat completion parameters
 		ChatCompletionParameters chatParams;
 		chatParams.messages = {
-			{"user", "Tell me a joke."} };
-		ChatCompletionParameters chatParams2;
-		chatParams2.messages = {
-			{"user", "What's the weather today?"} };
-		ChatCompletionParameters chatParams3;
-		chatParams3.messages = {
-			{"user", "What is Wololo"} };
-		ChatCompletionParameters chatParams4;
-		chatParams4.messages = {
-			{"user", "What is the meaning of life?"} };
-		ChatCompletionParameters chatParams5;
-		chatParams5.messages = {
-			{"user", "What is python"} };
+			{"user", "Jelaskan wololo secara detail"} };
+		chatParams.maxNewTokens = 512;
 
 		// Perform chat completion
 		auto start = std::chrono::high_resolution_clock::now();
 		int jobId = engine.submitChatCompleteJob(chatParams);
-		int jobId2 = engine.submitChatCompleteJob(chatParams2);
-		int jobId3 = engine.submitChatCompleteJob(chatParams3);
-		int jobId4 = engine.submitChatCompleteJob(chatParams4);
-		int jobId5 = engine.submitChatCompleteJob(chatParams5);
 
 		std::cout << "Chat completion job submitted with ID: 1" << std::endl;
 
@@ -72,124 +57,8 @@ int main(int argc, char* argv[])
 
 		std::cout << std::endl << "Time taken for chat completion: " << chatDuration.count() << " seconds" << std::endl;
 		std::cout << "Tokens: " << tokensSize << std::endl;
+		std::cout << "TPS: " << tokensSize / chatDuration.count() << std::endl;
 
-		std::cout << std::endl;
-
-		std::cout << "Chat completion job submitted with ID: 2" << std::endl;
-
-		lastTextSize = 0;
-		tokensSize = 0;
-		while (true)
-		{
-			CompletionResult result = engine.getJobResult(jobId2);
-			if (result.text.size() > lastTextSize) {
-				std::string newText = result.text.substr(lastTextSize);
-				std::cout << newText << std::flush; // Output new text
-				lastTextSize = result.text.size();
-			}
-			tokensSize = result.tokens.size();
-			if (engine.isJobFinished(jobId2)) {
-				break;
-			}
-			if (engine.hasJobError(jobId2)) {
-				std::cerr << "Job error: " << engine.getJobError(jobId2) << std::endl;
-				break;
-			}
-		}
-		end = std::chrono::high_resolution_clock::now();
-
-		chatDuration = end - start;
-		std::cout << std::endl << "Time taken for chat completion: " << chatDuration.count() << " seconds" << std::endl;
-		std::cout << "Tokens: " << tokensSize << std::endl;
-
-		std::cout << std::endl;
-
-		std::cout << "Chat completion job submitted with ID: 3" << std::endl;
-		
-		lastTextSize = 0;
-		tokensSize = 0;
-		while (true)
-		{
-			CompletionResult result = engine.getJobResult(jobId3);
-			if (result.text.size() > lastTextSize) {
-				std::string newText = result.text.substr(lastTextSize);
-				std::cout << newText << std::flush; // Output new text
-				lastTextSize = result.text.size();
-			}
-			tokensSize = result.tokens.size();
-			if (engine.isJobFinished(jobId3)) {
-				break;
-			}
-			if (engine.hasJobError(jobId3)) {
-				std::cerr << "Job error: " << engine.getJobError(jobId3) << std::endl;
-				break;
-			}
-		}
-		end = std::chrono::high_resolution_clock::now();
-		
-		chatDuration = end - start;
-		std::cout << std::endl << "Time taken for chat completion: " << chatDuration.count() << " seconds" << std::endl;
-		std::cout << "Tokens: " << tokensSize << std::endl;
-
-		std::cout << std::endl;
-
-		std::cout << "Chat completion job submitted with ID: 4" << std::endl;
-
-		lastTextSize = 0;
-		tokensSize = 0;
-		while (true)
-		{
-			CompletionResult result = engine.getJobResult(jobId4);
-			if (result.text.size() > lastTextSize) {
-				std::string newText = result.text.substr(lastTextSize);
-				std::cout << newText << std::flush; // Output new text
-				lastTextSize = result.text.size();
-			}
-			tokensSize = result.tokens.size();
-			if (engine.isJobFinished(jobId4)) {
-				break;
-			}
-			if (engine.hasJobError(jobId4)) {
-				std::cerr << "Job error: " << engine.getJobError(jobId4) << std::endl;
-				break;
-			}
-		}
-		end = std::chrono::high_resolution_clock::now();
-
-		chatDuration = end - start;
-		std::cout << std::endl << "Time taken for chat completion: " << chatDuration.count() << " seconds" << std::endl;
-		std::cout << "Tokens: " << tokensSize << std::endl;
-
-		std::cout << std::endl;
-
-		std::cout << "Chat completion job submitted with ID: 5" << std::endl;
-
-		lastTextSize = 0;
-		tokensSize = 0;
-
-		while (true)
-		{
-			CompletionResult result = engine.getJobResult(jobId5);
-			if (result.text.size() > lastTextSize) {
-				std::string newText = result.text.substr(lastTextSize);
-				std::cout << newText << std::flush; // Output new text
-				lastTextSize = result.text.size();
-			}
-			tokensSize = result.tokens.size();
-			if (engine.isJobFinished(jobId5)) {
-				break;
-			}
-			if (engine.hasJobError(jobId5)) {
-				std::cerr << "Job error: " << engine.getJobError(jobId5) << std::endl;
-				break;
-			}
-		}
-		end = std::chrono::high_resolution_clock::now();
-
-			
-		chatDuration = end - start;
-		std::cout << std::endl << "Time taken for chat completion: " << chatDuration.count() << " seconds" << std::endl;
-		std::cout << "Tokens: " << tokensSize << std::endl;
 		return 0;
 	}
 	catch (const std::exception& e)

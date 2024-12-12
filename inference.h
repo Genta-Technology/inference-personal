@@ -138,12 +138,6 @@ public:
 private:
 	struct Impl;
 	std::unique_ptr<Impl> pimpl;
-
-	/**
-	 * @brief Checks if a GPU is available for inference.
-	 * @return True if a GPU is available, false otherwise.
-	 */
-	bool isGpuAvailable();
 };
 
 #endif // INFERENCE_H

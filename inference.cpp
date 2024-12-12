@@ -7,19 +7,11 @@
 #include <condition_variable>
 #include <functional>
 #include <type_traits>
-#ifdef USE_GPU
-#include <cuda_runtime.h>
-#endif
 
 #include "llama.h"
 #include "common.h"
 #include "inference.h"
 #include "job.h"
-#ifdef USE_GPU
-#include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/plugins/api/tllmPlugin.h"
-#endif
 
 #define JOBS_SEED "[p(Pe6lSXKBO?edB`3cne4W,&RLcZ'S{2{Au*/o<?^!sca_JF?+Q-6g]/<F,P(U\\d\\t8+FcxD/DuM/\"G_v`<mN0Z`Pf&QX?;Y,k;ih,dB>EGLm0ua$o04,b5Gy(N(8Os@8}@_^J2xk=~ozG2\"BA)\\L^Ug|QyvR6b:\\PQZ71ZN@H$$lgi\"G3!>[saZ.#9]H$Hd\"Q7XE$S7aZLZsfEO9DU&<t85\"ot[er{}SlDzp~,@@p/hm83M+$?&Q5,KwW,Q?!a"
 
@@ -273,11 +265,11 @@ namespace
 		virtual void chatComplete(const ChatCompletionParameters& params, std::shared_ptr<Job> job) = 0;
 	};
 
-	// CpuInferenceService (CPU Implementation)
-	class CpuInferenceService : public InferenceService
+	// LlamaInferenceService (CPU Implementation)
+	class LlamaInferenceService : public InferenceService
 	{
 	public:
-		CpuInferenceService(
+		LlamaInferenceService(
 			std::shared_ptr<Tokenizer> tokenizer,
 			llama_model* model,
 			llama_context* context)
@@ -287,7 +279,7 @@ namespace
 		{
 		}
 
-		~CpuInferenceService()
+		~LlamaInferenceService()
 		{
 			llama_free(context);
 			llama_free_model(model);
@@ -342,7 +334,7 @@ namespace
 				return;
 			}
 
-			llama_batch batch = llama_batch_init(128, 0, 1);
+			llama_batch batch = llama_batch_init(512, 0, 1);
 
 			for (size_t i = 0; i < tokens.size(); i++)
 			{
@@ -351,7 +343,7 @@ namespace
 
 			batch.logits[batch.n_tokens - 1] = true;
 
-			if (llama_decode(context, batch) != 0) 
+			if (llama_decode(context, batch) != 0)
 			{
 				std::lock_guard<std::mutex> jobLock(job->mtx);
 				job->hasError = true;
@@ -477,162 +469,11 @@ namespace
 		llama_context* context;
 		std::mutex mtx;
 	};
-
-#ifdef USE_GPU
-
-	// GpuInferenceService (GPU Implementation)
-	class GpuInferenceService : public InferenceService
-	{
-	public:
-		GpuInferenceService(
-			std::shared_ptr<tensorrt_llm::executor::Executor> executor,
-			std::shared_ptr<Tokenizer> tokenizer)
-			: executor(std::move(executor)),
-			  tokenizer(std::move(tokenizer))
-		{
-		}
-
-		~GpuInferenceService()
-		{
-			// Resources are cleaned up by shared pointers and destructors
-		}
-
-		void complete(const CompletionParameters& params, std::shared_ptr<Job> job) override
-		{
-			std::lock_guard<std::mutex> lock(mtx);
-
-			if (!params.isValid())
-			{
-				std::lock_guard<std::mutex> jobLock(job->mtx);
-				job->hasError = true;
-				job->errorMessage = "Invalid completion parameters";
-				job->cv.notify_all();
-				return;
-			}
-
-			{
-				std::lock_guard<std::mutex> jobLock(job->mtx);
-				job->generatedTokens.clear();
-			}
-
-			// Tokenize the prompt
-			auto tokenIds = tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
-
-			auto request = tensorrt_llm::executor::Request(tokenIds, params.maxNewTokens);
-			auto samplingConfig = tensorrt_llm::executor::SamplingConfig(
-				1, std::nullopt, params.topP, std::nullopt, std::nullopt,
-				std::nullopt, params.randomSeed, params.temperature, params.minLength);
-			request.setSamplingConfig(samplingConfig);
-			request.setStreaming(false);
-			request.setEndId(llama_token_eos(tokenizer->getModel()));
-			request.setPadId(llama_token_pad(tokenizer->getModel()));
-
-			// Generate tokens
-			auto requestId = executor->enqueueRequest(request);
-			bool isFinished = false;
-			while (!isFinished)
-			{
-				std::vector<tensorrt_llm::executor::Response> responses;
-				while (responses.empty())
-				{
-					responses = executor->awaitResponses(requestId, std::chrono::milliseconds(100));
-				}
-				auto response = responses.at(0);
-
-				if (response.hasError())
-				{
-					std::lock_guard<std::mutex> jobLock(job->mtx);
-					job->hasError = true;
-					job->errorMessage = response.getErrorMsg();
-					job->cv.notify_all();
-					break;
-				}
-
-				auto result = response.getResult();
-				isFinished = result.isFinal;
-
-				std::string generatedText = tokenizer->detokenize(result.outputTokenIds.at(0));
-
-				{
-					std::lock_guard<std::mutex> jobLock(job->mtx);
-					job->generatedTokens.insert(job->generatedTokens.end(), result.outputTokenIds.begin(), result.outputTokenIds.at(0).end());
-					job->generatedText += generatedText;
-					job->cv.notify_all();
-				}
-			}
-
-			{
-				std::lock_guard<std::mutex> jobLock(job->mtx);
-				job->isFinished = true;
-				job->cv.notify_all();
-			}
-		}
-
-		void chatComplete(const ChatCompletionParameters& params, std::shared_ptr<Job> job) override
-		{
-			if (!params.isValid())
-			{
-				throw std::invalid_argument("Invalid chat completion parameters");
-			}
-
-			std::vector<llama_chat_message> messages;
-			for (const auto& msg : params.messages)
-			{
-				messages.push_back(llama_chat_message{ msg.role.c_str(), msg.content.c_str() });
-			}
-
-			// Prepare buffer for the formatted chat
-			std::vector<char> buf(81920);
-			int32_t ret_val = llama_chat_apply_template(
-				tokenizer->getModel(),
-				nullptr,
-				messages.data(),
-				messages.size(),
-				true,
-				buf.data(),
-				buf.size());
-
-			if (ret_val > static_cast<int32_t>(buf.size()))
-			{
-				buf.resize(ret_val);
-				ret_val = llama_chat_apply_template(
-					tokenizer->getModel(),
-					nullptr,
-					messages.data(),
-					messages.size(),
-					true,
-					buf.data(),
-					buf.size());
-			}
-
-			std::string formattedChat(buf.data(), ret_val);
-
-			CompletionParameters completionParams{
-				formattedChat,
-				params.randomSeed,
-				params.maxNewTokens,
-				params.minLength,
-				params.temperature,
-				params.topP,
-				params.streaming };
-
-			complete(completionParams, job);
-		}
-
-	private:
-		std::shared_ptr<tensorrt_llm::executor::Executor> executor;
-		std::shared_ptr<Tokenizer> tokenizer;
-		std::mutex mtx;
-	};
-
-#endif // USE_GPU
-
 } // namespace
 
 struct InferenceEngine::Impl
 {
 	std::unique_ptr<InferenceService> inferenceService;
-	bool use_gpu;
 
 	// Job management members
 	std::atomic<int> nextJobId{ 1 };
@@ -641,7 +482,7 @@ struct InferenceEngine::Impl
 
 	ThreadPool threadPool;
 
-	Impl(const std::string& engineDir, bool use_gpu);
+	Impl(const std::string& engineDir);
 	~Impl();
 
 	int submitCompleteJob(const CompletionParameters& params);
@@ -653,18 +494,13 @@ struct InferenceEngine::Impl
 	std::string getJobError(int job_id);
 };
 
-InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu)
-	: use_gpu(use_gpu), threadPool()
+InferenceEngine::Impl::Impl(const std::string& engineDir)
+	: threadPool()
 {
-#ifdef DEBUG
-#else
+#ifndef DEBUG
 	llama_log_set(llama_log_callback_null, NULL);
 #endif
 
-#ifdef USE_GPU
-	std::filesystem::path tokenizer_model_path = std::filesystem::path(engineDir) / "tokenizer.gguf";
-#else
-	// If USE_GPU is not defined, find any .gguf file in the engine directory
 	std::filesystem::path tokenizer_model_path;
 	for (const auto& entry : std::filesystem::directory_iterator(engineDir))
 	{
@@ -674,7 +510,6 @@ InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu)
 			break;
 		}
 	}
-#endif
 
 	if (!std::filesystem::exists(tokenizer_model_path))
 	{
@@ -685,6 +520,12 @@ InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu)
 	params.model = tokenizer_model_path.string().c_str();
 	params.n_ctx = 8192;
 	params.n_predict = 4096;
+	params.use_mlock = true;
+	params.grp_attn_n = 32;
+	params.warmup = false;
+#if defined(USE_CUDA) || defined(USE_VULKAN)
+	params.n_gpu_layers = 100;
+#endif
 
 	llama_backend_init();
 	llama_numa_init(params.numa);
@@ -692,61 +533,8 @@ InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu)
 	// Initialize the tokenizer
 	auto tokenizer = std::make_shared<Tokenizer>(tokenizer_model_path.string(), params);
 
-	if (use_gpu)
+	// Load the model
 	{
-#ifdef USE_GPU
-		std::cout << "GPU detected. Initializing GPU inference." << std::endl;
-		// Initialize TensorRT LLM plugins
-		initTrtLlmPlugins();
-
-#ifdef DEBUG
-		tensorrt_llm::common::TLLM_LOG(tensorrt_llm::common::Logger::Level::INFO);
-#else
-		tensorrt_llm::common::TLLM_LOG(tensorrt_llm::common::Logger::Level::ERROR);
-#endif
-
-		std::filesystem::path trtllmEnginePath = engineDir;
-		if (!std::filesystem::exists(trtllmEnginePath))
-		{
-			throw std::runtime_error("Engine folder not found");
-		}
-
-		auto config = tensorrt_llm::executor::ExecutorConfig(
-			1,
-			tensorrt_llm::executor::SchedulerConfig(
-				tensorrt_llm::executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT),
-			tensorrt_llm::executor::KvCacheConfig(),
-			false,
-			true,
-			tensorrt_llm::executor::kDefaultIterStatsMaxIterations,
-			tensorrt_llm::executor::kDefaultRequestStatsMaxIterations,
-			tensorrt_llm::executor::BatchingType::kINFLIGHT);
-
-		auto executor = std::make_shared<tensorrt_llm::executor::Executor>(
-			trtllmEnginePath, tensorrt_llm::executor::ModelType::kDECODER_ONLY,
-			config);
-
-		auto isLeaderProcess = executor->isLeaderProcess();
-
-		if (!isLeaderProcess)
-		{
-			throw std::runtime_error("Failed to initialize the executor.");
-		}
-
-		inferenceService = std::make_unique<GpuInferenceService>(
-			executor, tokenizer);
-
-#else
-		// If USE_GPU is not defined but GPU is available, notify the user.
-		std::cerr << "GPU is available but the library was not compiled with GPU support." << std::endl;
-		use_gpu = false;
-#endif
-	}
-
-	if (!use_gpu)
-	{
-		// Initialize CPU inference if GPU is not available
-		std::cout << "GPU not detected or not usable. Falling back to CPU inference." << std::endl;
 		std::cout << "Loading model from " << tokenizer_model_path << std::endl;
 
 		llama_model_params model_params = llama_model_params_from_gpt_params(params);
@@ -765,11 +553,11 @@ InferenceEngine::Impl::Impl(const std::string& engineDir, bool use_gpu)
 			throw std::runtime_error("Failed to create context with model");
 		}
 
-		inferenceService = std::make_unique<CpuInferenceService>(tokenizer, model, ctx);
+		inferenceService = std::make_unique<LlamaInferenceService>(tokenizer, model, ctx);
 	}
 }
 
-int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params) 
+int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params)
 {
 	int jobId = nextJobId++;
 
@@ -796,7 +584,7 @@ int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params)
 	return jobId;
 }
 
-int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters& params) 
+int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters& params)
 {
 	int jobId = nextJobId++;
 
@@ -823,7 +611,7 @@ int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters&
 	return jobId;
 }
 
-bool InferenceEngine::Impl::isJobFinished(int job_id) 
+bool InferenceEngine::Impl::isJobFinished(int job_id)
 {
 	std::shared_ptr<Job> job;
 
@@ -857,7 +645,7 @@ CompletionResult InferenceEngine::Impl::getJobResult(int job_id)
 	return { job->generatedTokens, job->generatedText };
 }
 
-void InferenceEngine::Impl::waitForJob(int job_id) 
+void InferenceEngine::Impl::waitForJob(int job_id)
 {
 	std::shared_ptr<Job> job;
 
@@ -874,7 +662,7 @@ void InferenceEngine::Impl::waitForJob(int job_id)
 	job->cv.wait(jobLock, [&job]() { return job->isFinished || job->hasError; });
 }
 
-bool InferenceEngine::Impl::hasJobError(int job_id) 
+bool InferenceEngine::Impl::hasJobError(int job_id)
 {
 	std::shared_ptr<Job> job;
 
@@ -891,7 +679,7 @@ bool InferenceEngine::Impl::hasJobError(int job_id)
 	return job->hasError;
 }
 
-std::string InferenceEngine::Impl::getJobError(int job_id) 
+std::string InferenceEngine::Impl::getJobError(int job_id)
 {
 	std::shared_ptr<Job> job;
 
@@ -915,7 +703,7 @@ InferenceEngine::Impl::~Impl()
 }
 
 InferenceEngine::InferenceEngine(const std::string& engineDir)
-	: pimpl(std::make_unique<Impl>(engineDir, isGpuAvailable()))
+	: pimpl(std::make_unique<Impl>(engineDir))
 {
 }
 
@@ -955,14 +743,3 @@ std::string InferenceEngine::getJobError(int job_id)
 }
 
 InferenceEngine::~InferenceEngine() = default;
-
-bool InferenceEngine::isGpuAvailable()
-{
-#ifdef USE_GPU
-	int deviceCount = 0;
-	cudaError_t error_id = cudaGetDeviceCount(&deviceCount);
-	return (error_id == cudaSuccess && deviceCount > 0);
-#else
-	return false;
-#endif
-}
