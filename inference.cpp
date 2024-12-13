@@ -131,6 +131,9 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
 		// Don't allow enqueueing after stopping the pool
 		if (stop)
 		{
+#ifdef DEBUG
+			std::cerr << "enqueue on stopped ThreadPool" << std::endl;
+#endif
 			throw std::runtime_error("enqueue on stopped ThreadPool");
 		}
 
@@ -207,13 +210,17 @@ namespace
 	Tokenizer::Tokenizer(const std::string& modelPath, const gpt_params params)
 		: tokenizer_model(nullptr), tokenizer_context(nullptr), add_bos(false)
 	{
+#ifdef DEBUG
 		std::cout << "Loading tokenizer model from: " << modelPath << std::endl;
-
+#endif
 		llama_model_params model_params = llama_model_params_from_gpt_params(params);
 		model_params.vocab_only = true;
 		tokenizer_model = llama_load_model_from_file(modelPath.c_str(), model_params);
 		if (tokenizer_model == NULL)
 		{
+#ifdef DEBUG
+			std::cerr << "Failed to load tokenizer from " << modelPath << std::endl;
+#endif
 			throw std::runtime_error("Failed to load tokenizer from " + params.model);
 		}
 
@@ -223,6 +230,9 @@ namespace
 		tokenizer_context = llama_new_context_with_model(tokenizer_model, ctx_params);
 		if (tokenizer_context == NULL)
 		{
+#ifdef DEBUG
+			std::cerr << "Failed to create tokenizer context" << std::endl;
+#endif
 			throw std::runtime_error("Error: could not create tokenizer context.");
 		}
 
@@ -414,6 +424,9 @@ namespace
 		{
 			if (!params.isValid())
 			{
+#ifdef DEBUG
+				std::cerr << "Invalid chat completion parameters" << std::endl;
+#endif
 				throw std::invalid_argument("Invalid chat completion parameters");
 			}
 
@@ -485,8 +498,8 @@ struct InferenceEngine::Impl
 	Impl(const std::string& engineDir);
 	~Impl();
 
-	int submitCompleteJob(const CompletionParameters& params);
-	int submitChatCompleteJob(const ChatCompletionParameters& params);
+	int submitCompletionsJob(const CompletionParameters& params);
+	int submitChatCompletionsJob(const ChatCompletionParameters& params);
 	bool isJobFinished(int job_id);
 	CompletionResult getJobResult(int job_id);
 	void waitForJob(int job_id);
@@ -513,6 +526,9 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 
 	if (!std::filesystem::exists(tokenizer_model_path))
 	{
+#ifdef DEBUG
+		std::cerr << "Tokenizer model not found from " << tokenizer_model_path << std::endl;
+#endif
 		throw std::runtime_error("Tokenizer model not found from" + tokenizer_model_path.string());
 	}
 
@@ -535,12 +551,16 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 
 	// Load the model
 	{
+#ifdef DEBUG
 		std::cout << "Loading model from " << tokenizer_model_path << std::endl;
-
+#endif
 		llama_model_params model_params = llama_model_params_from_gpt_params(params);
 		llama_model* model = llama_load_model_from_file(params.model.c_str(), model_params);
 		if (model == NULL)
 		{
+#ifdef DEBUG
+			std::cerr << "Failed to load model from " << params.model << std::endl;
+#endif
 			throw std::runtime_error("Failed to load model from " + params.model);
 		}
 
@@ -550,6 +570,9 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 		llama_context* ctx = llama_new_context_with_model(model, ctx_params);
 		if (ctx == NULL)
 		{
+#ifdef DEBUG
+			std::cerr << "Failed to create context with model" << std::endl;
+#endif
 			throw std::runtime_error("Failed to create context with model");
 		}
 
@@ -557,7 +580,7 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 	}
 }
 
-int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params)
+int InferenceEngine::Impl::submitCompletionsJob(const CompletionParameters& params)
 {
 	int jobId = nextJobId++;
 
@@ -584,7 +607,7 @@ int InferenceEngine::Impl::submitCompleteJob(const CompletionParameters& params)
 	return jobId;
 }
 
-int InferenceEngine::Impl::submitChatCompleteJob(const ChatCompletionParameters& params)
+int InferenceEngine::Impl::submitChatCompletionsJob(const ChatCompletionParameters& params)
 {
 	int jobId = nextJobId++;
 
@@ -619,6 +642,9 @@ bool InferenceEngine::Impl::isJobFinished(int job_id)
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) {
+#ifdef DEBUG
+			std::cerr << "Invalid job ID" << std::endl;
+#endif
 			throw std::invalid_argument("Invalid job ID");
 		}
 		job = it->second;
@@ -636,6 +662,9 @@ CompletionResult InferenceEngine::Impl::getJobResult(int job_id)
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) {
+#ifdef DEBUG
+			std::cerr << "Invalid job ID" << std::endl;
+#endif
 			throw std::invalid_argument("Invalid job ID");
 		}
 		job = it->second;
@@ -653,6 +682,9 @@ void InferenceEngine::Impl::waitForJob(int job_id)
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) {
+#ifdef DEBUG
+			std::cerr << "Invalid job ID" << std::endl;
+#endif
 			throw std::invalid_argument("Invalid job ID");
 		}
 		job = it->second;
@@ -670,6 +702,9 @@ bool InferenceEngine::Impl::hasJobError(int job_id)
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) {
+#ifdef DEBUG
+			std::cerr << "Invalid job ID" << std::endl;
+#endif
 			throw std::invalid_argument("Invalid job ID");
 		}
 		job = it->second;
@@ -687,6 +722,9 @@ std::string InferenceEngine::Impl::getJobError(int job_id)
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) {
+#ifdef DEBUG
+			std::cerr << "Invalid job ID" << std::endl;
+#endif
 			throw std::invalid_argument("Invalid job ID");
 		}
 		job = it->second;
@@ -702,44 +740,52 @@ InferenceEngine::Impl::~Impl()
 	llama_backend_free();
 }
 
-InferenceEngine::InferenceEngine(const std::string& engineDir)
+INFERENCE_API InferenceEngine::InferenceEngine(const std::string& engineDir)
 	: pimpl(std::make_unique<Impl>(engineDir))
 {
 }
 
-int InferenceEngine::submitCompleteJob(const CompletionParameters& params)
+INFERENCE_API int InferenceEngine::submitCompletionsJob(const CompletionParameters& params)
 {
-	return pimpl->submitCompleteJob(params);
+	return pimpl->submitCompletionsJob(params);
 }
 
-int InferenceEngine::submitChatCompleteJob(const ChatCompletionParameters& params)
+INFERENCE_API int InferenceEngine::submitChatCompletionsJob(const ChatCompletionParameters& params)
 {
-	return pimpl->submitChatCompleteJob(params);
+	return pimpl->submitChatCompletionsJob(params);
 }
 
-bool InferenceEngine::isJobFinished(int job_id)
+INFERENCE_API bool InferenceEngine::isJobFinished(int job_id)
 {
 	return pimpl->isJobFinished(job_id);
 }
 
-CompletionResult InferenceEngine::getJobResult(int job_id)
+INFERENCE_API CompletionResult InferenceEngine::getJobResult(int job_id)
 {
 	return pimpl->getJobResult(job_id);
 }
 
-void InferenceEngine::waitForJob(int job_id)
+INFERENCE_API void InferenceEngine::waitForJob(int job_id)
 {
 	pimpl->waitForJob(job_id);
 }
 
-bool InferenceEngine::hasJobError(int job_id)
+INFERENCE_API bool InferenceEngine::hasJobError(int job_id)
 {
 	return pimpl->hasJobError(job_id);
 }
 
-std::string InferenceEngine::getJobError(int job_id)
+INFERENCE_API std::string InferenceEngine::getJobError(int job_id)
 {
 	return pimpl->getJobError(job_id);
 }
 
-InferenceEngine::~InferenceEngine() = default;
+INFERENCE_API InferenceEngine::~InferenceEngine() = default;
+
+std::unique_ptr<InferenceEngine> InferenceEngine::instance = nullptr;
+std::mutex InferenceEngine::instanceMutex;
+
+extern "C" INFERENCE_API InferenceEngine* getInferenceEngine(const char* engineDir)
+{
+	return &InferenceEngine::getInstance(engineDir);
+}

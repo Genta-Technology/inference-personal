@@ -10,6 +10,12 @@
 #include <atomic>
 #include <exception>
 
+#ifdef INFERENCE_EXPORTS
+#define INFERENCE_API __declspec(dllexport)
+#else
+#define INFERENCE_API __declspec(dllimport)
+#endif
+
 //-----------------------------------------------------------------------------------------------
 // Data Structures
 //-----------------------------------------------------------------------------------------------
@@ -72,28 +78,34 @@ struct CompletionResult
  *
  * The engine is responsible for managing the completion jobs and returning the results.
  */
-class InferenceEngine
+class INFERENCE_API InferenceEngine
 {
 public:
-	/**
-	 * @brief Constructs an InferenceEngine with the specified engine directory.
-	 * @param engineDir The directory where the engine is located.
-	 */
-	explicit InferenceEngine(const std::string& engineDir);
+	static InferenceEngine& getInstance(const std::string& engineDir)
+	{
+		static InferenceEngine instance(engineDir);
+		return instance;
+	}
+
+	// Delete copy constructor and assignment operator
+	InferenceEngine(const InferenceEngine&) = delete;
+	InferenceEngine& operator=(const InferenceEngine&) = delete;
+	InferenceEngine(InferenceEngine&&) = delete;
+	InferenceEngine& operator=(InferenceEngine&&) = delete;
 
 	/**
 	 * @brief Submits a completion job and returns the job ID.
 	 * @param params The parameters for the completion job.
 	 * @return The ID of the submitted job.
 	 */
-	int submitCompleteJob(const CompletionParameters& params);
+	int submitCompletionsJob(const CompletionParameters& params);
 
 	/**
 	 * @brief Submits a chat completion job and returns the job ID.
 	 * @param params The parameters for the chat completion job.
 	 * @return The ID of the submitted job.
 	 */
-	int submitChatCompleteJob(const ChatCompletionParameters& params);
+	int submitChatCompletionsJob(const ChatCompletionParameters& params);
 
 	/**
 	 * @brief Checks if a job is finished.
@@ -135,9 +147,30 @@ public:
 	 */
 	~InferenceEngine();
 
+	/**
+	 * @brief Resets the singleton instance with a new engine directory.
+	 * @param engineDir The new directory where the engine is located.
+	 */
+	static void resetInstance(const std::string& engineDir)
+	{
+		std::lock_guard<std::mutex> lock(instanceMutex);
+		instance.reset(new InferenceEngine(engineDir));
+	}
+
 private:
+	/**
+	 * @brief Constructs an InferenceEngine with the specified engine directory.
+	 * @param engineDir The directory where the engine is located.
+	 */
+	explicit InferenceEngine(const std::string& engineDir);
+
 	struct Impl;
 	std::unique_ptr<Impl> pimpl;
+
+	static std::unique_ptr<InferenceEngine> instance;
+	static std::mutex instanceMutex;
 };
+
+extern "C" INFERENCE_API InferenceEngine* getInferenceEngine(const char* engineDir);
 
 #endif // INFERENCE_H
