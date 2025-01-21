@@ -27,7 +27,7 @@ def generate_salt(desired_value, mod_value=10, salt_length=256):
         # If no suitable character is found, retry with a new initial_salt
 
 # Desired MAX_CONCURRENT_JOBS value
-desired_max_jobs = 4  # Set your desired value here
+desired_max_jobs = 1  # Set your desired value here
 
 # Generate the salt
 salt = generate_salt(desired_max_jobs, mod_value=10, salt_length=256)

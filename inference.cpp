@@ -7,13 +7,27 @@
 #include <condition_variable>
 #include <functional>
 #include <type_traits>
+#ifdef USE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
 
 #include "llama.h"
 #include "common.h"
+#include "sampling.h"
 #include "inference.h"
 #include "job.h"
 
 #define JOBS_SEED "[p(Pe6lSXKBO?edB`3cne4W,&RLcZ'S{2{Au*/o<?^!sca_JF?+Q-6g]/<F,P(U\\d\\t8+FcxD/DuM/\"G_v`<mN0Z`Pf&QX?;Y,k;ih,dB>EGLm0ua$o04,b5Gy(N(8Os@8}@_^J2xk=~ozG2\"BA)\\L^Ug|QyvR6b:\\PQZ71ZN@H$$lgi\"G3!>[saZ.#9]H$Hd\"Q7XE$S7aZLZsfEO9DU&<t85\"ot[er{}SlDzp~,@@p/hm83M+$?&Q5,KwW,Q?!a"
+
+inline size_t getThreadNumber()
+{
+	std::string seed = JOBS_SEED;
+	uint32_t hash = 0;
+	for (char c : seed) {
+		hash = (hash * 131 + (unsigned char)c) % (1ULL << 32);
+	}
+	return hash % 10;
+}
 
 class ThreadPool {
 public:
@@ -27,6 +41,9 @@ public:
 
 	// Shutdown the thread pool
 	void shutdown();
+
+	// Return the number of active threads in the pool
+	size_t size() const { return workers.size(); }
 
 private:
 	// Worker function for each thread
@@ -48,16 +65,10 @@ private:
 
 inline ThreadPool::ThreadPool() : stop(false)
 {
-	std::string seed = JOBS_SEED;
-	uint32_t hash = 0;
-	for (char c : seed) {
-		hash = (hash * 131 + (unsigned char)c) % (1ULL << 32);
-	}
-
-	size_t num_threads = hash % 10;
+	size_t num_threads = getThreadNumber();
 
 #ifdef DEBUG
-	std::cout << "Creating thread pool with " << num_threads << " threads" << std::endl;
+	std::cout << "[INFERENCE] Creating thread pool with " << num_threads << " threads" << std::endl;
 #endif
 
 	for (size_t i = 0; i < num_threads; ++i)
@@ -117,6 +128,10 @@ template<class F, class... Args>
 auto ThreadPool::enqueue(F&& f, Args&&... args)
 -> std::future<typename std::invoke_result<F, Args...>::type>
 {
+#ifdef DEBUG
+	std::cout << "[INFERENCE] Enqueueing task to thread pool" << std::endl;
+#endif
+
 	using return_type = typename std::invoke_result<F, Args...>::type;
 
 	auto task_ptr = std::make_shared<std::packaged_task<return_type()>>(
@@ -131,10 +146,8 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
 		// Don't allow enqueueing after stopping the pool
 		if (stop)
 		{
-#ifdef DEBUG
-			std::cerr << "enqueue on stopped ThreadPool" << std::endl;
-#endif
-			throw std::runtime_error("enqueue on stopped ThreadPool");
+			std::cerr << "[INFERENCE] [ERROR] Enqueue on stopped ThreadPool" << std::endl;
+			return res;
 		}
 
 		tasks.emplace([task_ptr]() { (*task_ptr)(); });
@@ -146,23 +159,80 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
 
 bool CompletionParameters::isValid() const
 {
-	return !prompt.empty() &&
-		randomSeed >= 0 &&
-		maxNewTokens >= 0 && maxNewTokens <= 4096 &&
-		minLength >= 0 && minLength <= 4096 &&
-		temperature >= 0.0f &&
-		topP >= 0.0f && topP <= 1.0f;
+	if (sizeof(prompt) <= 0)
+	{
+		std::cerr << "[INFERENCE] [ERROR] prompt is empty: " << prompt << std::endl;
+		return false;
+	}
+
+	if (randomSeed < 0)
+	{
+		std::cerr << "[INFERENCE] [ERROR] randomSeed is negative: " << randomSeed << std::endl;
+		return false;
+	}
+
+	if (maxNewTokens < 0 || maxNewTokens > 4096)
+	{
+		std::cerr << "[INFERENCE] [ERROR] maxNewTokens is out of range: " << maxNewTokens << std::endl;
+		return false;
+	}
+
+	if (minLength < 0 || minLength > 4096)
+	{
+		std::cerr << "[INFERENCE] [ERROR] minLength is out of range: " << minLength << std::endl;
+		return false;
+	}
+
+	if (temperature < 0.0f)
+	{
+		std::cerr << "[INFERENCE] [ERROR] temperature is negative: " << temperature << std::endl;
+		return false;
+	}
+
+	if (topP < 0.0f || topP > 1.0f)
+	{
+		std::cerr << "[INFERENCE] [ERROR] topP is out of range: " << topP << std::endl;
+		return false;
+	}
+
+	return true;
 }
 
 bool ChatCompletionParameters::isValid() const
 {
-	if (messages.empty() ||
-		randomSeed < 0 ||
-		maxNewTokens < 0 || maxNewTokens > 4096 ||
-		minLength < 0 || minLength > 4096 ||
-		temperature < 0.0f ||
-		topP < 0.0f || topP > 1.0f)
+	if (messages.empty())
 	{
+		std::cerr << "[INFERENCE] [ERROR] messages is empty; size: " << messages.size() << std::endl;
+		return false;
+	}
+
+	if (randomSeed < 0)
+	{
+		std::cerr << "[INFERENCE] [ERROR] randomSeed is negative: " << randomSeed << std::endl;
+		return false;
+	}
+
+	if (maxNewTokens < 0 || maxNewTokens > 4096)
+	{
+		std::cerr << "[INFERENCE] [ERROR] maxNewTokens is out of range: " << maxNewTokens << std::endl;
+		return false;
+	}
+
+	if (minLength < 0 || minLength > 4096)
+	{
+		std::cerr << "[INFERENCE] [ERROR] minLength is out of range: " << minLength << std::endl;
+		return false;
+	}
+
+	if (temperature < 0.0f)
+	{
+		std::cerr << "[INFERENCE] [ERROR] temperature is negative: " << temperature << std::endl;
+		return false;
+	}
+
+	if (topP < 0.0f || topP > 1.0f)
+	{
+		std::cerr << "[INFERENCE] [ERROR] topP is out of range: " << topP << std::endl;
 		return false;
 	}
 
@@ -170,9 +240,11 @@ bool ChatCompletionParameters::isValid() const
 	{
 		if (message.role != "user" && message.role != "system" && message.role != "assistant")
 		{
+			std::cerr << "[INFERENCE] [ERROR] Invalid role in message: " << message.role << std::endl;
 			return false;
 		}
 	}
+
 	return true;
 }
 
@@ -211,17 +283,15 @@ namespace
 		: tokenizer_model(nullptr), tokenizer_context(nullptr), add_bos(false)
 	{
 #ifdef DEBUG
-		std::cout << "Loading tokenizer model from: " << modelPath << std::endl;
+		std::cout << "[INFERENCE] Loading tokenizer model from: " << modelPath << std::endl;
 #endif
 		llama_model_params model_params = llama_model_params_from_gpt_params(params);
 		model_params.vocab_only = true;
 		tokenizer_model = llama_load_model_from_file(modelPath.c_str(), model_params);
 		if (tokenizer_model == NULL)
 		{
-#ifdef DEBUG
-			std::cerr << "Failed to load tokenizer from " << modelPath << std::endl;
-#endif
-			throw std::runtime_error("Failed to load tokenizer from " + params.model);
+			std::cerr << "[INFERENCE] [ERROR] Could not load tokenizer model from " << modelPath << "\n" << std::endl;
+			return;
 		}
 
 		llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
@@ -230,10 +300,8 @@ namespace
 		tokenizer_context = llama_new_context_with_model(tokenizer_model, ctx_params);
 		if (tokenizer_context == NULL)
 		{
-#ifdef DEBUG
-			std::cerr << "Failed to create tokenizer context" << std::endl;
-#endif
-			throw std::runtime_error("Error: could not create tokenizer context.");
+			std::cerr << "[INFERENCE] [ERROR] Could not create context with tokenizer model" << "\n" << std::endl;
+			return;
 		}
 
 		add_bos = llama_add_bos_token(tokenizer_model);
@@ -247,7 +315,7 @@ namespace
 
 	std::vector<int32_t> Tokenizer::tokenize(const std::string& text, bool add_bos_token)
 	{
-		std::vector<llama_token> tokens = llama_tokenize(tokenizer_model, text.c_str(), add_bos_token, true);
+		std::vector<llama_token> tokens = ::llama_tokenize(tokenizer_context, text.c_str(), true, true);
 		return std::vector<int32_t>(tokens.begin(), tokens.end());
 	}
 
@@ -279,13 +347,8 @@ namespace
 	class LlamaInferenceService : public InferenceService
 	{
 	public:
-		LlamaInferenceService(
-			std::shared_ptr<Tokenizer> tokenizer,
-			llama_model* model,
-			llama_context* context)
-			: tokenizer(std::move(tokenizer)),
-			model(model),
-			context(context)
+		LlamaInferenceService(std::shared_ptr<Tokenizer> tokenizer, llama_model* model, llama_context* context, gpt_params params, ggml_threadpool* threadpool)
+			: tokenizer(std::move(tokenizer)), model(model), context(context), g_params(params), threadpool(threadpool)
 		{
 		}
 
@@ -293,10 +356,27 @@ namespace
 		{
 			llama_free(context);
 			llama_free_model(model);
+
+			ggml_threadpool_free(threadpool);
 		}
 
 		void complete(const CompletionParameters& params, std::shared_ptr<Job> job) override
 		{
+#ifdef DEBUG
+			std::cout << "[INFERENCE] [COMPLETE] Starting completion" << std::endl;
+
+			// Print the parameters
+			std::cout << "[INFERENCE] [COMPLETE] Chat completion parameters: " << std::endl;
+			std::cout
+				<< "[INFERENCE] [COMPLETE] Random seed: "		<< params.randomSeed << std::endl
+				<< "[INFERENCE] [COMPLETE] Max new tokens: "	<< params.maxNewTokens << std::endl
+				<< "[INFERENCE] [COMPLETE] Min length: "		<< params.minLength << std::endl
+				<< "[INFERENCE] [COMPLETE] Temperature: "		<< params.temperature << std::endl
+				<< "[INFERENCE] [COMPLETE] Top P: "				<< params.topP << std::endl;
+
+			std::cout << "[INFERENCE] [COMPLETE] Prompt: "		<< params.prompt << std::endl;
+#endif
+
 			std::lock_guard<std::mutex> lock(mtx);
 
 			if (!params.isValid())
@@ -308,110 +388,278 @@ namespace
 				return;
 			}
 
-			auto sparams = llama_sampler_chain_default_params();
-			sparams.no_perf = false;
-			llama_sampler* sampler = llama_sampler_chain_init(sparams);
-			llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
-			llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
-			llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.randomSeed));
-			llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params.topP, 1));
-			//llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params.topK));
+			auto sparams		= g_params.sparams;
+			sparams.no_perf		= true;
+			sparams.top_p		= params.topP;
+			sparams.temp		= params.temperature;
+			sparams.seed		= params.randomSeed;
+			// sparams.top_k	= params.topK;
+
+			gpt_sampler* sampler = gpt_sampler_init(model, sparams);
+			if (!sampler) 
+			{
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = "Could not initialize sampler";
+				job->cv.notify_all();
+				return;
+			}
 
 			{
 				std::lock_guard<std::mutex> jobLock(job->mtx);
 				job->generatedTokens.clear();
+				job->generatedText.clear();
 			}
 
-			// Tokenize the prompt
-			auto tokens = tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
+			// Attempt to load existing session (KV cache) if "kvCacheFilePath" is set
+			std::string path_session = params.kvCacheFilePath;
+			std::vector<llama_token> session_tokens;  // The tokens we previously saved
 
-			const int n_ctx = llama_n_ctx(context);
-			const int n_kv_req = tokens.size() + (params.maxNewTokens - tokens.size());
+			if (!path_session.empty()) {
+				// Attempt to load
+				if (!std::filesystem::exists(path_session)) {
+					// file doesn't exist => no old cache
+					printf("[KV] session file does not exist, will create.\n");
+				}
+				else if (std::filesystem::is_empty(path_session)) {
+					// file is empty => treat as brand-new
+					printf("[KV] session file is empty, new session.\n");
+				}
+				else {
+					// The file exists and is not empty
+					session_tokens.resize(g_params.n_ctx);  // allocate buffer
+					size_t n_token_count_out = 0;
+
+					if (!llama_state_load_file(
+						context,
+						path_session.c_str(),
+						session_tokens.data(),
+						session_tokens.capacity(),
+						&n_token_count_out
+					)) {
+						// If load fails, handle error
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->hasError = true;
+						job->errorMessage = "Failed to load session file: " + path_session;
+						job->cv.notify_all();
+						gpt_sampler_free(sampler);
+						return;
+					}
+
+					// The llama_state_load_file call gives us how many tokens were in that old session
+					session_tokens.resize(n_token_count_out);
 
 #ifdef DEBUG
-			std::cout << "Min length: " << params.minLength << std::endl;
-			std::cout << "n_ctx: " << n_ctx << std::endl;
-			std::cout << "n_kv_req: " << n_kv_req << std::endl;
+					printf("[INFERENCE] [KV] loaded session with prompt size: %d tokens\n", (int)session_tokens.size());
+					printf("[INFERENCE] [KV] tokens decoded: %s", tokenizer->detokenize(session_tokens).c_str());
+#endif
+				}
+			}
+
+#ifdef DEBUG
+			std::cout << "[INFERENCE] [COMPLETE] Tokenizing prompt" << std::endl;
 #endif
 
-			if (n_kv_req > n_ctx)
-			{
-				std::lock_guard<std::mutex> jobLock(job->mtx);
-				job->hasError = true;
-				job->errorMessage = "The prompt is too long";
-				job->cv.notify_all();
-				llama_sampler_free(sampler);
-				return;
+			std::vector<llama_token> embd_inp;  // "embedding input"
+			if (session_tokens.empty() || !params.prompt.empty()) {
+				// If the session cache is empty OR we have a brand new prompt,
+				// we tokenize from scratch.
+#ifdef DEBUG
+				std::cout << "[INFERENCE] Tokenizing new prompt" << std::endl;
+#endif
+				embd_inp = tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
+			}
+			else {
+#ifdef DEBUG
+				std::cout << "[INFERENCE] Reusing session tokens from disk" << std::endl;
+#endif
+				// If we want to re-use exactly what was loaded, we do:
+				embd_inp = session_tokens;
 			}
 
-			llama_batch batch = llama_batch_init(512, 0, 1);
-
-			for (size_t i = 0; i < tokens.size(); i++)
-			{
-				llama_batch_add(batch, tokens[i], i, { 0 }, false);
+			if (embd_inp.empty()) {
+				// Attempt to add BOS if configured
+				if (tokenizer->shouldAddBos()) {
+					embd_inp.push_back(llama_token_bos(model));
+				}
+				else {
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->hasError = true;
+					job->errorMessage = "Empty prompt and no BOS token available.";
+					job->cv.notify_all();
+					return;
+				}
 			}
 
-			batch.logits[batch.n_tokens - 1] = true;
-
-			if (llama_decode(context, batch) != 0)
-			{
-				std::lock_guard<std::mutex> jobLock(job->mtx);
-				job->hasError = true;
-				job->errorMessage = "Could not decode tokens.";
-				job->cv.notify_all();
-				llama_batch_free(batch);
-				llama_sampler_free(sampler);
-				return;
-			}
-
-			int n_cur = batch.n_tokens;
-			int n_decode = 0;
-
-			while (n_cur <= params.maxNewTokens)
-			{
-				// sample the next token
-				{
-					const llama_token new_token_id = llama_sampler_sample(sampler, context, -1);
-
-					// if the new token is an end-of-sequence token or we have reached the maximum number of tokens
-					// we stop generating new tokens
-					if (llama_token_is_eog(model, new_token_id) || n_cur == params.maxNewTokens)
+			size_t n_matching_session_tokens = 0;
+			if (!session_tokens.empty()) {
+				for (llama_token id : session_tokens) {
+					if (n_matching_session_tokens >= embd_inp.size()
+						|| id != embd_inp[n_matching_session_tokens])
 					{
 						break;
 					}
+#ifdef DEBUG
+					std::cout << "[INFERENCE] [KV] Matched token: "
+						<< id << " == " << embd_inp[n_matching_session_tokens] << std::endl;
+#endif
 
-					std::string tokenText = tokenizer->decode(new_token_id);
+					n_matching_session_tokens++;
+				}
+#ifdef DEBUG
+				if (n_matching_session_tokens == embd_inp.size()) {
+					std::cout << "[INFERENCE] Session file has an exact match for the prompt." << std::endl;
+				}
+				else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
+					std::cout << "[INFERENCE] Session file has low similarity to prompt ("
+						<< n_matching_session_tokens << " / " << embd_inp.size()
+						<< "); will mostly be re-evaluated." << std::endl;
+				}
+				else {
+					std::cout << "[INFERENCE] Session file matches "
+						<< n_matching_session_tokens << " / "
+						<< embd_inp.size() << " tokens of prompt." << std::endl;
+				}
+#endif
 
-					{
-						std::lock_guard<std::mutex> jobLock(job->mtx);
-						job->generatedTokens.push_back(new_token_id);
-						job->generatedText += tokenText;
-						job->cv.notify_all();
-					}
-
-					// prepare the next batch
-					llama_batch_clear(batch);
-
-					// push this new token for next evaluation
-					llama_batch_add(batch, new_token_id, n_cur, { 0 }, true);
-
-					n_decode++;
+				if (session_tokens.size() > embd_inp.size())
+				{
+					--n_matching_session_tokens; // always force to re-evaluate the last token
 				}
 
-				n_cur++;
+				// Remove any "future" tokens that don’t match
+				// i.e. we only keep the portion that matched
+				llama_kv_cache_seq_rm(context, -1 /*any key_id*/, n_matching_session_tokens, -1 /*up to end*/);
+				session_tokens.resize(n_matching_session_tokens);
+#ifdef DEBUG
+				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(session_tokens.size() - n_matching_session_tokens));
+				printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
+#endif
+			}
+			
+			int n_past		= (int)n_matching_session_tokens;
+			int n_ctx		= llama_n_ctx(context);
+			int n_consumed	= (int)n_matching_session_tokens;   // how many from embd_inp have we fed to the model?
+			int n_remain	= params.maxNewTokens; // how many new tokens to generate?
 
-				// evaluate the current batch with the transformer model
-				if (llama_decode(context, batch)) {
+			std::vector<llama_token> embd; // we'll gather tokens to evaluate in batches
+
+			while (true)
+			{
+				// If we still have new user-supplied tokens to process (from embd_inp):
+				if ((int)embd_inp.size() > n_consumed) {
+					std::cout << std::endl << "[INFERENCE] [COMPLETE] Processing user-supplied tokens" << std::endl;
+
+					// push tokens from embd_inp into embd
+					embd.push_back(embd_inp[n_consumed]);
+					++n_consumed;
+
+					// If the batch is large, or we reached the end of embd_inp, we do decode:
+					if ((int)embd.size() >= g_params.n_batch || (int)embd_inp.size() == n_consumed) {
+						// Evaluate these new tokens
+						if (n_past + (int)embd.size() > n_ctx) {
+							// We are out of context!
+							std::lock_guard<std::mutex> jobLock(job->mtx);
+							job->hasError = true;
+							job->errorMessage = "Context overflow: prompt too long";
+							job->cv.notify_all();
+							break;
+						}
+
+						llama_decode(context, llama_batch_get_one(embd.data(),
+							(int)embd.size(),
+							n_past,
+							0 /*seq id*/));
+						n_past += (int)embd.size();
+
+						// If we have a session file, append these new tokens
+						if (!path_session.empty()) {
+							session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
+						}
+						embd.clear();
+					}
+					continue;  // process next chunk
+				}
+
+				// We have already processed all user-supplied tokens. Now let’s generate more (model output).
+				if (n_remain <= 0) {
+					// We have generated enough new tokens, so stop
+					break;
+				}
+
+				// Sample next token
+				llama_token id = gpt_sampler_sample(sampler, context, /*last_logits_id=*/-1);
+				gpt_sampler_accept(sampler, id, /*accept_grammar=*/true);
+
+				// If we’re out of context, break
+				if (n_past + 1 > n_ctx) {
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 					job->hasError = true;
-					job->errorMessage = "Could not decode tokens.";
+					job->errorMessage = "Context overflow while generating";
 					job->cv.notify_all();
 					break;
 				}
+
+				// Append to embd for next iteration
+				embd.push_back(id);
+
+				// Evaluate immediately in single-token batch (or accumulate, up to you)
+				if (llama_decode(context,
+					llama_batch_get_one(&id, 1, n_past, 0 /*threads*/)))
+				{
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->hasError = true;
+					job->errorMessage = "Could not decode next token";
+					job->cv.notify_all();
+					break;
+				}
+
+				// Increase count
+				n_past += 1;
+				n_remain -= 1;
+
+				// If it’s end-of-sequence or an <eos> token, we stop
+				if (llama_token_is_eog(model, id) || (id == llama_token_eos(model)) ||
+					id == 32000 || id == 2) 
+				{
+					break;
+				}
+
+				// Add the generated token to job->generated* so user sees partial results
+				{
+					std::string token_str = tokenizer->decode(id);
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->generatedTokens.push_back(id);
+					job->generatedText += token_str;
+					job->cv.notify_all();
+				}
+
+				// If we have a session file, record new tokens
+				if (!path_session.empty()) {
+					session_tokens.push_back(id);
+				}
+
+				embd.clear();  // we already consumed that single token
 			}
 
-			llama_batch_free(batch);
-			llama_sampler_free(sampler);
+			// Save the final KV cache to disk
+			if (!path_session.empty()) {
+#ifdef DEBUG
+				std::cout << "[INFERENCE] [KV] Saving final session to file: " << path_session << std::endl;
+				std::cout << "[INFERENCE] [KV] Session final size: " << session_tokens.size() << std::endl;
+#endif
+				llama_state_save_file(context,
+					path_session.c_str(),
+					session_tokens.data(),
+					session_tokens.size());
+			}
+
+#ifdef DEBUG
+			std::cout << "[INFERENCE] [COMPLETE] Decoding completed" << std::endl;
+#endif
+
+			gpt_sampler_free(sampler);
+			llama_kv_cache_clear(context);
 
 			{
 				std::lock_guard<std::mutex> jobLock(job->mtx);
@@ -422,65 +670,75 @@ namespace
 
 		void chatComplete(const ChatCompletionParameters& params, std::shared_ptr<Job> job) override
 		{
+#ifdef DEBUG
+			std::cout << "[INFERENCE] [CHATCOMPLETE] Starting chat completion" << std::endl;
+
+			// Print the parameters
+			std::cout << "[INFERENCE] [CHATCOMPLETE] Chat completion parameters: " << std::endl;
+			std::cout
+				<< "[INFERENCE] [CHATCOMPLETE] Random seed: " << params.randomSeed << std::endl
+				<< "[INFERENCE] [CHATCOMPLETE] Max new tokens: " << params.maxNewTokens << std::endl
+				<< "[INFERENCE] [CHATCOMPLETE] Min length: " << params.minLength << std::endl
+				<< "[INFERENCE] [CHATCOMPLETE] Temperature: " << params.temperature << std::endl
+				<< "[INFERENCE] [CHATCOMPLETE] Top P: " << params.topP << std::endl;
+
+			for (const auto& message : params.messages)
+			{
+				std::cout << "[INFERENCE] [CHATCOMPLETE] Role: " << message.role << " Content: " << message.content << std::endl;
+			}
+#endif
+
 			if (!params.isValid())
 			{
-#ifdef DEBUG
-				std::cerr << "Invalid chat completion parameters" << std::endl;
-#endif
-				throw std::invalid_argument("Invalid chat completion parameters");
+				std::cerr << "[INFERENCE] [CHATCOMPLETE] [ERROR] Invalid chat completion parameters\n" << std::endl;
+				return;
 			}
+
+#ifdef DEBUG
+			std::cout << "[INFERENCE] [CHATCOMPLETE] Applying chat completion template" << std::endl;
+#endif
 
 			// Format the chat messages into a single prompt
-			std::vector<llama_chat_message> messages;
+			std::vector<llama_chat_msg> messages;
 			for (const auto& msg : params.messages)
 			{
-				messages.push_back(llama_chat_message{ msg.role.c_str(), msg.content.c_str() });
+				messages.push_back(llama_chat_msg{ msg.role, msg.content });
 			}
 
-			// Prepare buffer for the formatted chat
-			std::vector<char> buf(81920);
-			int32_t ret_val = llama_chat_apply_template(
-				tokenizer->getModel(),
-				nullptr,
-				messages.data(),
-				messages.size(),
-				true,
-				buf.data(),
-				buf.size());
-
-			// If the buffer is too small, resize and re-apply the template
-			if (ret_val > static_cast<int32_t>(buf.size()))
+			std::cout << "[INFERENCE] [CHATCOMPLETE] Messages" << std::endl;
+			for (const auto& msg : messages)
 			{
-				buf.resize(ret_val);
-				ret_val = llama_chat_apply_template(
-					tokenizer->getModel(),
-					nullptr,
-					messages.data(),
-					messages.size(),
-					true,
-					buf.data(),
-					buf.size());
+				std::cout << "[INFERENCE] [CHATCOMPLETE] Role: " << msg.role << " Content: " << msg.content << std::endl;
 			}
 
-			std::string formattedChat(buf.data(), ret_val);
-
+			llama_model* model = tokenizer->getModel();
+			if (!model)
+			{
+				std::cerr << "[INFERENCE] [CHATCOMPLETE] [ERROR] Could not get model from tokenizer\n" << std::endl;
+				return;
+			}
+			std::string formatted = llama_chat_apply_template(model, "", messages, true);
 			CompletionParameters completionParams{
-				formattedChat,
+				formatted.c_str(),
 				params.randomSeed,
 				params.maxNewTokens,
 				params.minLength,
 				params.temperature,
 				params.topP,
-				params.streaming };
+				params.streaming,
+				params.kvCacheFilePath
+			};
 
 			complete(completionParams, job);
 		}
 
 	private:
-		std::shared_ptr<Tokenizer> tokenizer;
-		llama_model* model;
-		llama_context* context;
-		std::mutex mtx;
+		std::shared_ptr<Tokenizer>	tokenizer;
+		llama_model*				model;
+		llama_context*				context;
+		std::mutex					mtx;
+		gpt_params					g_params;
+		ggml_threadpool*			threadpool;
 	};
 } // namespace
 
@@ -495,7 +753,7 @@ struct InferenceEngine::Impl
 
 	ThreadPool threadPool;
 
-	Impl(const std::string& engineDir);
+	Impl(const char* engineDir, const int mainGpuId = 0);
 	~Impl();
 
 	int submitCompletionsJob(const CompletionParameters& params);
@@ -507,7 +765,7 @@ struct InferenceEngine::Impl
 	std::string getJobError(int job_id);
 };
 
-InferenceEngine::Impl::Impl(const std::string& engineDir)
+InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 	: threadPool()
 {
 #ifndef DEBUG
@@ -526,10 +784,8 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 
 	if (!std::filesystem::exists(tokenizer_model_path))
 	{
-#ifdef DEBUG
-		std::cerr << "Tokenizer model not found from " << tokenizer_model_path << std::endl;
-#endif
-		throw std::runtime_error("Tokenizer model not found from" + tokenizer_model_path.string());
+		std::cerr << "[INFERENCE] [ERROR] Tokenizer model not found from " << tokenizer_model_path << "\n" << std::endl;
+		return;
 	}
 
 	gpt_params params;
@@ -539,9 +795,16 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 	params.use_mlock = true;
 	params.grp_attn_n = 32;
 	params.warmup = false;
+	params.cpuparams.n_threads = getThreadNumber();
+	params.cpuparams_batch.n_threads = getThreadNumber();
+	params.flash_attn = true;
 #if defined(USE_CUDA) || defined(USE_VULKAN)
+	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
+
 	params.n_gpu_layers = 100;
 #endif
+
+	std::cout << "[INFERENCE] Using main GPU ID: " << params.main_gpu << std::endl;
 
 	llama_backend_init();
 	llama_numa_init(params.numa);
@@ -552,31 +815,30 @@ InferenceEngine::Impl::Impl(const std::string& engineDir)
 	// Load the model
 	{
 #ifdef DEBUG
-		std::cout << "Loading model from " << tokenizer_model_path << std::endl;
+		std::cout << "[INFERENCE] Loading model from " << tokenizer_model_path << std::endl;
 #endif
-		llama_model_params model_params = llama_model_params_from_gpt_params(params);
-		llama_model* model = llama_load_model_from_file(params.model.c_str(), model_params);
+		// Load model and apply lora adapters, if any
+		llama_init_result	llama_init	= llama_init_from_gpt_params(params);
+		llama_model*		model		= llama_init.model;
+		llama_context*		ctx			= llama_init.context;
+
 		if (model == NULL)
 		{
-#ifdef DEBUG
-			std::cerr << "Failed to load model from " << params.model << std::endl;
-#endif
-			throw std::runtime_error("Failed to load model from " + params.model);
+			std::cerr << "[INFERENCE] [ERROR] Failed to load model from " << params.model << "\n" << std::endl;
 		}
 
-		llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
-		ctx_params.n_threads = GGML_DEFAULT_N_THREADS;
-		ctx_params.n_threads_batch = GGML_DEFAULT_N_THREADS;
-		llama_context* ctx = llama_new_context_with_model(model, ctx_params);
-		if (ctx == NULL)
-		{
-#ifdef DEBUG
-			std::cerr << "Failed to create context with model" << std::endl;
-#endif
-			throw std::runtime_error("Failed to create context with model");
+		struct ggml_threadpool_params threadpool_params;
+		ggml_threadpool_params_init(&threadpool_params, getThreadNumber());
+		threadpool_params.prio = GGML_SCHED_PRIO_REALTIME;
+		set_process_priority(GGML_SCHED_PRIO_REALTIME);
+		struct ggml_threadpool* threadpool = ggml_threadpool_new(&threadpool_params);
+		llama_attach_threadpool(ctx, threadpool, nullptr);
+
+		if (!llama_model_has_encoder(model)) {
+			GGML_ASSERT(!llama_add_eos_token(model));
 		}
 
-		inferenceService = std::make_unique<LlamaInferenceService>(tokenizer, model, ctx);
+		inferenceService = std::make_unique<LlamaInferenceService>(tokenizer, model, ctx, params, threadpool);
 	}
 }
 
@@ -588,16 +850,23 @@ int InferenceEngine::Impl::submitCompletionsJob(const CompletionParameters& para
 	job->jobId = jobId;
 
 	// Asynchronously execute the job using thread pool
-	threadPool.enqueue([this, params, job]() {
-		try {
-			this->inferenceService->complete(params, job);
-		}
-		catch (const std::exception& e) {
-			std::lock_guard<std::mutex> lock(job->mtx);
-			job->hasError = true;
-			job->errorMessage = e.what();
-		}
-		});
+	try {
+		threadPool.enqueue([this, params, job]() {
+			try {
+				this->inferenceService->complete(params, job);
+			}
+			catch (const std::exception& e) {
+				std::lock_guard<std::mutex> lock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = e.what();
+			}
+			});
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "[INFERENCE] [ERROR] " << e.what() << std::endl;
+		return -1;
+	}
 
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
@@ -614,17 +883,35 @@ int InferenceEngine::Impl::submitChatCompletionsJob(const ChatCompletionParamete
 	auto job = std::make_shared<Job>();
 	job->jobId = jobId;
 
+#ifdef DEBUG
+	std::cout << "[INFERENCE] Submitting chat completions job to queue" << std::endl;
+#endif
+
 	// Asynchronously execute the job using thread pool
-	threadPool.enqueue([this, params, job]() {
-		try {
-			this->inferenceService->chatComplete(params, job);
-		}
-		catch (const std::exception& e) {
-			std::lock_guard<std::mutex> lock(job->mtx);
-			job->hasError = true;
-			job->errorMessage = e.what();
-		}
-		});
+	try
+	{
+		threadPool.enqueue([this, params, job]() {
+			try {
+#ifdef DEBUG
+				std::cout << "[INFERENCE] Processing completion task to engine" << std::endl;
+#endif
+
+				this->inferenceService->chatComplete(params, job);
+			}
+			catch (const std::exception& e) {
+				std::lock_guard<std::mutex> lock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = e.what();
+
+				std::cerr << "[INFERENCE] [ERROR] " << e.what() << "\n" << std::endl;
+			}
+			});
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "[INFERENCE] [ERROR] " << e.what() << std::endl;
+		return -1;
+	}
 
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
@@ -641,11 +928,10 @@ bool InferenceEngine::Impl::isJobFinished(int job_id)
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
-		if (it == jobs.end()) {
-#ifdef DEBUG
-			std::cerr << "Invalid job ID" << std::endl;
-#endif
-			throw std::invalid_argument("Invalid job ID");
+		if (it == jobs.end())
+		{
+			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			return false;
 		}
 		job = it->second;
 	}
@@ -661,11 +947,10 @@ CompletionResult InferenceEngine::Impl::getJobResult(int job_id)
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
-		if (it == jobs.end()) {
-#ifdef DEBUG
-			std::cerr << "Invalid job ID" << std::endl;
-#endif
-			throw std::invalid_argument("Invalid job ID");
+		if (it == jobs.end()) 
+		{
+			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			return { {}, "" };
 		}
 		job = it->second;
 	}
@@ -681,11 +966,10 @@ void InferenceEngine::Impl::waitForJob(int job_id)
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
-		if (it == jobs.end()) {
-#ifdef DEBUG
-			std::cerr << "Invalid job ID" << std::endl;
-#endif
-			throw std::invalid_argument("Invalid job ID");
+		if (it == jobs.end()) 
+		{
+			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			return;
 		}
 		job = it->second;
 	}
@@ -701,11 +985,10 @@ bool InferenceEngine::Impl::hasJobError(int job_id)
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
-		if (it == jobs.end()) {
-#ifdef DEBUG
-			std::cerr << "Invalid job ID" << std::endl;
-#endif
-			throw std::invalid_argument("Invalid job ID");
+		if (it == jobs.end()) 
+		{
+			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			return false;
 		}
 		job = it->second;
 	}
@@ -721,11 +1004,10 @@ std::string InferenceEngine::Impl::getJobError(int job_id)
 	{
 		std::lock_guard<std::mutex> lock(jobsMutex);
 		auto it = jobs.find(job_id);
-		if (it == jobs.end()) {
-#ifdef DEBUG
-			std::cerr << "Invalid job ID" << std::endl;
-#endif
-			throw std::invalid_argument("Invalid job ID");
+		if (it == jobs.end()) 
+		{
+			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			return "";
 		}
 		job = it->second;
 	}
@@ -740,18 +1022,43 @@ InferenceEngine::Impl::~Impl()
 	llama_backend_free();
 }
 
-INFERENCE_API InferenceEngine::InferenceEngine(const std::string& engineDir)
-	: pimpl(std::make_unique<Impl>(engineDir))
+INFERENCE_API InferenceEngine::InferenceEngine()
+	: pimpl(nullptr)
 {
+}
+
+INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int mainGpuId)
+{
+#ifdef DEBUG
+	std::cout << "[INFERENCE] Loading model from " << engineDir << std::endl;
+#endif
+	this->pimpl.reset();
+
+	try {
+		this->pimpl = std::make_unique<Impl>(engineDir, mainGpuId);
+	}
+	catch (const std::exception& e) {
+		std::cerr << "[INFERENCE] [ERROR] Could not load model from: " << engineDir << "\nError: " << e.what() << "\n" << std::endl;
+		return false;
+	}
+	return true;
 }
 
 INFERENCE_API int InferenceEngine::submitCompletionsJob(const CompletionParameters& params)
 {
+#ifdef DEBUG
+	std::cout << "[INFERENCE] Submitting completions job" << std::endl;
+#endif
+
 	return pimpl->submitCompletionsJob(params);
 }
 
 INFERENCE_API int InferenceEngine::submitChatCompletionsJob(const ChatCompletionParameters& params)
 {
+#ifdef DEBUG
+	std::cout << "[INFERENCE] Submitting chat completions job" << std::endl;
+#endif
+
 	return pimpl->submitChatCompletionsJob(params);
 }
 
@@ -782,10 +1089,7 @@ INFERENCE_API std::string InferenceEngine::getJobError(int job_id)
 
 INFERENCE_API InferenceEngine::~InferenceEngine() = default;
 
-std::unique_ptr<InferenceEngine> InferenceEngine::instance = nullptr;
-std::mutex InferenceEngine::instanceMutex;
-
-extern "C" INFERENCE_API InferenceEngine* getInferenceEngine(const char* engineDir)
+extern "C" INFERENCE_API IInferenceEngine* createInferenceEngine()
 {
-	return &InferenceEngine::getInstance(engineDir);
+	return new InferenceEngine();
 }

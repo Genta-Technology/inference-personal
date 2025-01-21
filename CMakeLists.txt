@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.14)
 project(InferenceEngine)
 
+include(cmake/ucm.cmake)
+
+ucm_set_runtime(STATIC)
+
 # Options
 option(USE_CUDA   "Compile with CUDA support" OFF)
 option(USE_VULKAN "Compile with VULKAN support" OFF)
@@ -10,6 +14,8 @@ option(DEBUG      "Compile with debugging information" OFF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+
+ucm_print_flags()
 
 # Source files
 set(SOURCES
@@ -41,28 +47,7 @@ target_include_directories(${TARGET_NAME} PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Compiler flags and definitions
-if(MSVC)
-  # MSVC-specific compiler flags
-  target_compile_options(${TARGET_NAME} PRIVATE
-    $<$<CONFIG:Debug>:/W3 /MDd /Zi /Od /RTC1>
-    $<$<CONFIG:Release>:/W3 /MD /O2>
-  )
-  target_compile_definitions(${TARGET_NAME} PRIVATE
-    $<$<CONFIG:Debug>:DEBUG>
-    $<$<CONFIG:Release>:NDEBUG>
-  )
-else()
-  # GCC/Clang-specific compiler flags
-  target_compile_options(${TARGET_NAME} PRIVATE
-    $<$<CONFIG:Debug>:-Wall -g>
-    $<$<CONFIG:Release>:-Wall -O3 -DNDEBUG>
-  )
-  target_compile_definitions(${TARGET_NAME} PRIVATE
-    $<$<CONFIG:Debug>:DEBUG>
-    $<$<CONFIG:Release>:NDEBUG>
-  )
-endif()
+install(TARGETS ${TARGET_NAME} RUNTIME)
 
 # Find llama.cpp library
 set(LLAMA_CPP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp")
@@ -70,17 +55,23 @@ if(NOT EXISTS "${LLAMA_CPP_PATH}/CMakeLists.txt")
   message(FATAL_ERROR "llama.cpp not found at ${LLAMA_CPP_PATH}. Please clone it or adjust LLAMA_CPP_PATH.")
 endif()
 
+# Disable GGML_NATIVE for llama.cpp for cross-compilation
+set(GGML_NATIVE           OFF CACHE BOOL "Disable LLAMA_NATIVE in llama.cpp" FORCE)
+set(INS_ENB               ON  CACHE BOOL "Enable INS_ENB in llama.cpp"       FORCE)
+
 # Set llama.cpp options before adding the subdirectory
 set(LLAMA_BUILD_TESTS     OFF CACHE BOOL "Disable llama.cpp tests"        FORCE)
 set(LLAMA_BUILD_EXAMPLES  OFF CACHE BOOL "Disable llama.cpp examples"     FORCE)
 set(LLAMA_BUILD_SERVER    OFF CACHE BOOL "Disable llama.cpp server"       FORCE)
 set(LLAMA_ALL_WARNINGS    OFF CACHE BOOL "Disable warnings in llama.cpp"  FORCE)
-set(GGML_BLAS             ON  CACHE BOOL "Enable GGML BLAS support"       FORCE)
 
 # Build llama.cpp as a static library
 set(BUILD_SHARED_LIBS	  OFF CACHE BOOL "Build llama.cpp as a static lib" FORCE)
 set(GGML_STATIC_LINK      ON  CACHE BOOL "Static link ggml libraries"      FORCE)
 set(GGML_STATIC           ON  CACHE BOOL "Static link ggml libraries"      FORCE)
+
+# Disable AVX512 for llama.cpp
+set(LLAMA_AVX512          OFF CACHE BOOL "Disable AVX512 in llama.cpp"     FORCE)
 
 # Enable GGML acceleration
 if(USE_CUDA)
@@ -96,7 +87,7 @@ if(USE_CUDA)
   endif()
 elseif(USE_VULKAN)
   set(GGML_VULKAN ON CACHE BOOL "Enable GGML Vulkan support" FORCE)
-  message(STATUS "Using ROCm for GGML acceleration")
+  message(STATUS "Using vulkan for GGML acceleration")
 
   find_package(Vulkan REQUIRED)
   if(Vulkan_FOUND)
@@ -106,14 +97,14 @@ elseif(USE_VULKAN)
     message(FATAL_ERROR "Vulkan not found. Please install Vulkan SDK.")
   endif()
 else()
-  set(GGML_OPENBLAS ON CACHE BOOL "Enable GGML OpenBLAS support" FORCE)
   message(STATUS "Using OpenBLAS for GGML acceleration")
 endif()
 
-# define USE_CUDA and USE_VULKAN for inference.cpp
+# define USE_CUDA and USE_VULKAN and DEBUG for inference.cpp
 target_compile_definitions(${TARGET_NAME} PUBLIC
   $<$<BOOL:${USE_CUDA}>:USE_CUDA>
   $<$<BOOL:${USE_VULKAN}>:USE_VULKAN>
+  $<$<BOOL:${DEBUG}>:DEBUG>
 )
 
 # Add llama.cpp subdirectory
@@ -132,6 +123,8 @@ target_include_directories(${TARGET_NAME} PUBLIC
 # Include Threads
 find_package(Threads REQUIRED)
 target_link_libraries(${TARGET_NAME} PUBLIC Threads::Threads)
+
+target_compile_features(${TARGET_NAME} PRIVATE cxx_std_11)
 
 # Set the output directory
 set_target_properties(${TARGET_NAME} PROPERTIES
@@ -164,3 +157,14 @@ else()
     COMMENT "Creating release archive ${RELEASE_NAME}.tar.gz"
   )
 endif()
+
+
+# Add test
+add_executable(test_inference test.cpp)
+target_include_directories(test_inference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_inference PRIVATE ${TARGET_NAME})
+
+# Put the test in the bin directory
+set_target_properties(test_inference PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
