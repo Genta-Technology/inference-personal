@@ -63,6 +63,7 @@ set(INS_ENB               ON  CACHE BOOL "Enable INS_ENB in llama.cpp"       FOR
 set(LLAMA_BUILD_TESTS     OFF CACHE BOOL "Disable llama.cpp tests"        FORCE)
 set(LLAMA_BUILD_EXAMPLES  OFF CACHE BOOL "Disable llama.cpp examples"     FORCE)
 set(LLAMA_BUILD_SERVER    OFF CACHE BOOL "Disable llama.cpp server"       FORCE)
+set(LLAMA_BUILD_COMMON    ON  CACHE BOOL "Enable  llama.cpp common"       FORCE)
 set(LLAMA_ALL_WARNINGS    OFF CACHE BOOL "Disable warnings in llama.cpp"  FORCE)
 
 # Build llama.cpp as a static library
@@ -112,6 +113,8 @@ add_subdirectory(${LLAMA_CPP_PATH})
 
 # Link llama.cpp library
 target_link_libraries(${TARGET_NAME} PRIVATE llama common ggml)
+
+target_compile_features(${TARGET_NAME} PRIVATE cxx_std_17)
 
 # Include directories for ${TARGET_NAME}
 target_include_directories(${TARGET_NAME} PUBLIC

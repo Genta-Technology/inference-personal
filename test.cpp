@@ -18,7 +18,7 @@ typedef InferenceEngine* (CreateInferenceEngineFunc)();
 
 int main(int argc, char* argv[])
 {
-	std::string modelPath = "C:\\Users\\rifky\\OneDrive\\Documents\\GitHub\\kolosal\\out\\build\\x64-Release-Debug\\models\\llama-3.2-1B\\int8";
+	std::string modelPath = "C:\\Users\\rifky\\OneDrive\\Documents\\GitHub\\kolosal\\out\\build\\x64-Release-Debug\\models\\deepseek-r1-qwen-1.5b\\int4";
 	
 #ifdef USE_VULKAN
 	std::string libraryName = "InferenceEngineLibVulkan.dll";
