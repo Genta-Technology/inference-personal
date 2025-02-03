@@ -555,6 +555,16 @@ namespace
 			std::vector<llama_token> embd;  // batch of tokens to evaluate
 			
 			while (true) {
+				if (job->cancelRequested.load()) {
+					{
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->errorMessage = "Generation cancelled by user.";
+						job->isFinished = true;
+						job->cv.notify_all();
+					}
+					break;
+				}
+
 				// 1. If we still have prompt tokens left to feed, push them into `embd`:
 				if (i_prompt < (int)embd_inp.size()) {
 					while (i_prompt < (int)embd_inp.size() && (int)embd.size() < n_batch) {
@@ -594,6 +604,16 @@ namespace
 				// 2. We have consumed all prompt tokens, so now we generate the model’s output
 				if (n_remain <= 0) {
 					// done generating
+					break;
+				}
+
+				if (job->cancelRequested.load()) {
+					{
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->errorMessage = "Generation cancelled by user.";
+						job->isFinished = true;
+						job->cv.notify_all();
+					}
 					break;
 				}
 
@@ -769,6 +789,7 @@ struct InferenceEngine::Impl
 
 	int submitCompletionsJob(const CompletionParameters& params);
 	int submitChatCompletionsJob(const ChatCompletionParameters& params);
+	void stopJob(int job_id);
 	bool isJobFinished(int job_id);
 	CompletionResult getJobResult(int job_id);
 	void waitForJob(int job_id);
@@ -806,8 +827,7 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 
 	common_params params;
 	params.model						= tokenizer_model_path.string().c_str();
-	params.n_ctx						= 8192;
-	params.n_predict					= 4096;
+	params.n_ctx						= 4096;
 	params.use_mlock					= true;
 	params.use_mmap						= false;
 	params.cont_batching				= false;
@@ -933,6 +953,17 @@ int InferenceEngine::Impl::submitChatCompletionsJob(const ChatCompletionParamete
 	}
 
 	return jobId;
+}
+
+void InferenceEngine::Impl::stopJob(int job_id) {
+	std::lock_guard<std::mutex> lock(jobsMutex);
+	auto it = jobs.find(job_id);
+	if (it != jobs.end()) {
+		it->second->cancelRequested.store(true);
+		// Optionally notify any waiting threads:
+		std::lock_guard<std::mutex> jobLock(it->second->mtx);
+		it->second->cv.notify_all();
+	}
 }
 
 bool InferenceEngine::Impl::isJobFinished(int job_id)
@@ -1082,6 +1113,11 @@ INFERENCE_API int InferenceEngine::submitChatCompletionsJob(const ChatCompletion
 #endif
 
 	return pimpl->submitChatCompletionsJob(params);
+}
+
+INFERENCE_API void InferenceEngine::stopJob(int job_id)
+{
+	pimpl->stopJob(job_id);
 }
 
 INFERENCE_API bool InferenceEngine::isJobFinished(int job_id)
