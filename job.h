@@ -18,6 +18,7 @@ struct Job {
     bool isFinished = false;
     bool hasError = false;
     std::string errorMessage;
+    float tps = 0;
 };
 
 #endif // JOB_H
