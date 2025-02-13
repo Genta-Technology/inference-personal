@@ -539,11 +539,21 @@ namespace
 #endif
 			}
 
+
 			int n_past		= (int)n_matching_session_tokens;   // how many tokens are “in” the model’s cache
 			int n_ctx		= llama_n_ctx(context);
 			int n_batch		= g_params.n_batch;					// how many tokens to evaluate at once
 			int n_remain	= params.maxNewTokens;				// generation budget
-			int i_prompt	= (int)n_matching_session_tokens;					// how many from embd_inp have been consumed
+			int i_prompt	= (int)n_matching_session_tokens;	// how many from embd_inp have been consumed
+
+			// Grouped Attention (Self-Extend) Configuration
+			int ga_n		= g_params.grp_attn_n;
+			int ga_w		= g_params.grp_attn_w;
+			int ga_i		= 0;	
+
+			// Context Trimming Configuration
+			int n_keep		= 128;
+			int n_discard	= 1;
 
 #ifdef DEBUG
 			std::cout << "[INFERENCE] [COMPLETE] Starting decode loop\n"
@@ -554,7 +564,8 @@ namespace
 
 			std::vector<llama_token> embd;  // batch of tokens to evaluate
 			
-			while (true) {
+			while (true) 
+			{
 				if (job->cancelRequested.load()) {
 					{
 						std::lock_guard<std::mutex> jobLock(job->mtx);
@@ -566,33 +577,43 @@ namespace
 				}
 
 				// 1. If we still have prompt tokens left to feed, push them into `embd`:
-				if (i_prompt < (int)embd_inp.size()) {
-					while (i_prompt < (int)embd_inp.size() && (int)embd.size() < n_batch) {
+				if (i_prompt < (int)embd_inp.size()) 
+				{
+					while (i_prompt < (int)embd_inp.size() && (int)embd.size() < n_batch) 
+					{
 						embd.push_back(embd_inp[i_prompt]);
 						++i_prompt;
 					}
 
 					// Evaluate prompt tokens in batch:
-					if (!embd.empty()) {
-						if (n_past + (int)embd.size() > n_ctx) {
-							// out of context
-							std::lock_guard<std::mutex> jobLock(job->mtx);
-							job->hasError = true;
-							job->errorMessage = "Context overflow: prompt too long";
-							job->cv.notify_all();
-							break;
+					if (!embd.empty()) 
+					{
+						if (n_past + (int)embd.size() > n_ctx) 
+						{
+							kv_cache_seq_ltrim(context, n_keep, session_tokens, n_past);
+
+							if (n_past + (int)embd.size() > n_ctx) {
+								std::lock_guard<std::mutex> jobLock(job->mtx);
+								job->hasError = true;
+								job->errorMessage = "Context overflow even after trimming.";
+								job->cv.notify_all();
+								common_sampler_free(sampler);
+								return;
+							}
 						}
 
 						// **Accept** these tokens in the sampler so it accounts them in repetition-penalty, etc.
 						// For prompt tokens, use `accept_grammar = false` in typical llama.cpp usage:
-						for (auto t : embd) {
+						for (auto t : embd) 
+						{
 							common_sampler_accept(sampler, t, /*accept_grammar=*/false);
 						}
 
 						llama_decode(context, llama_batch_get_one(embd.data(), (int)embd.size()));
 						n_past += (int)embd.size();
 
-						if (!path_session.empty()) {
+						if (!path_session.empty()) 
+						{
 							session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
 						}
 
@@ -617,20 +638,29 @@ namespace
 					break;
 				}
 
+
+				// check for context overflow
+				if (n_past + 1 > n_ctx)
+				{
+					kv_cache_seq_ltrim(context, n_keep, session_tokens, n_past);
+
+					if (n_past + 1 > n_ctx) {
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->hasError = true;
+						job->errorMessage = "Context overflow even after trimming.";
+						job->cv.notify_all();
+						common_sampler_free(sampler);
+						return;
+					}
+
+					std::cout << "\n\n[CONTEXT SHIFT]\n\n";
+				}
+
 				// sample the next token
 				llama_token id = common_sampler_sample(sampler, context, -1);
 
 				// accept it into the sampler for subsequent penalty calculations
 				common_sampler_accept(sampler, id, /*accept_grammar=*/true);
-
-				// check for context overflow
-				if (n_past + 1 > n_ctx) {
-					std::lock_guard<std::mutex> jobLock(job->mtx);
-					job->hasError = true;
-					job->errorMessage = "Context overflow while generating";
-					job->cv.notify_all();
-					break;
-				}
 
 				// append this token to `embd`
 				embd.push_back(id);
@@ -770,6 +800,62 @@ namespace
 		std::mutex					mtx;
 		common_params				g_params;
 		ggml_threadpool*			threadpool;
+
+		// Revised left-trim function with batched recompute
+		void kv_cache_seq_ltrim(llama_context* context,
+			int n_keep,
+			std::vector<llama_token>& session_tokens,
+			int& n_past) {
+			// If we already have n_keep or fewer tokens, no trimming is needed.
+			if (n_past <= n_keep) {
+				return;
+			}
+
+			// If we have enough tokens stored to replay, then recompute.
+			if (session_tokens.size() >= (size_t)n_keep) {
+				// Extract the tokens to keep (i.e. the last n_keep tokens).
+				std::vector<llama_token> keptTokens(session_tokens.end() - n_keep, session_tokens.end());
+
+				// Clear the KV cache entirely to remove outdated positional info.
+				llama_kv_cache_clear(context);
+
+				// Replay the kept tokens in batches to rebuild the hidden state.
+				int new_n_past = 0;
+				const int batch_size = 16; // Adjust this batch size as needed.
+				for (size_t i = 0; i < keptTokens.size(); i += batch_size) {
+					int curr_batch_size = std::min((size_t)batch_size, keptTokens.size() - i);
+					if (llama_decode(context, llama_batch_get_one(keptTokens.data() + i, curr_batch_size))) {
+						std::cerr << "Error re-decoding tokens during recompute" << std::endl;
+						// Handle the error as needed (e.g., break or return).
+					}
+					new_n_past += curr_batch_size;
+				}
+				n_past = new_n_past;
+
+				// Update session_tokens to only the kept tokens.
+				session_tokens = keptTokens;
+			}
+			else {
+				// Fallback: if there aren't enough tokens in session_tokens,
+				// perform the direct shift method.
+				int n_discard = n_past - n_keep;
+
+				// Remove tokens from the KV cache in the range [n_keep, n_keep+n_discard).
+				llama_kv_cache_seq_rm(context, -1, n_keep, n_keep + n_discard);
+
+				// Shift the remaining tokens left by n_discard.
+				llama_kv_cache_seq_add(context, -1, n_keep + n_discard, n_past, -n_discard);
+
+				// Update session_tokens by erasing the tokens that were discarded.
+				if (!session_tokens.empty() && (n_keep + n_discard) <= (int)session_tokens.size()) {
+					session_tokens.erase(session_tokens.begin() + n_keep,
+						session_tokens.begin() + n_keep + n_discard);
+				}
+
+				// Update the token count.
+				n_past -= n_discard;
+			}
+		}
 	};
 } // namespace
 
@@ -827,12 +913,13 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 
 	common_params params;
 	params.model						= tokenizer_model_path.string().c_str();
-	params.n_ctx						= 4096;
+	params.n_ctx						= 256;
 	params.use_mlock					= true;
 	params.use_mmap						= false;
 	params.cont_batching				= false;
 	params.warmup						= false;
 	params.cpuparams.n_threads			= inferenceThreads;
+	params.n_batch						= 16;
 	//params.flash_attn					= true;
 #if defined(USE_CUDA) || defined(USE_VULKAN)
 	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
@@ -1094,6 +1181,18 @@ INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int m
 		std::cerr << "[INFERENCE] [ERROR] Could not load model from: " << engineDir << "\nError: " << e.what() << "\n" << std::endl;
 		return false;
 	}
+	return true;
+}
+
+INFERENCE_API bool InferenceEngine::unloadModel()
+{
+	if (!this->pimpl)
+	{
+		std::cerr << "[INFERENCE] [ERROR] Model not loaded\n" << std::endl;
+		return false;
+	}
+
+	this->pimpl.reset();
 	return true;
 }
 
