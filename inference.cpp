@@ -495,19 +495,66 @@ namespace
 
 			size_t n_matching_session_tokens = 0;
 			if (!session_tokens.empty()) {
-				for (llama_token id : session_tokens) {
-					if (n_matching_session_tokens >= embd_inp.size()
-						|| id != embd_inp[n_matching_session_tokens])
-					{
-						break;
-					}
-#ifdef DEBUG
-					std::cout << "[INFERENCE] [KV] Matched token: "
-						<< id << " == " << embd_inp[n_matching_session_tokens] << std::endl;
-#endif
+				const size_t n_preserve = g_params.n_keep;
 
-					n_matching_session_tokens++;
+				if (embd_inp.size() < n_preserve) {
+					for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+						if (embd_inp[i] != session_tokens[i])
+							break;
+						n_matching_session_tokens++;
+					}
 				}
+				else {
+					// First, check the preserved prefix.
+					bool prefix_matches = true;
+					for (size_t i = 0; i < n_preserve; i++) {
+						if (embd_inp[i] != session_tokens[i]) {
+							prefix_matches = false;
+							break;
+						}
+					}
+					if (!prefix_matches) {
+						// Fallback to simple matching from the beginning.
+						for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+							if (embd_inp[i] != session_tokens[i])
+								break;
+							n_matching_session_tokens++;
+						}
+					}
+					else {
+						// The preserved prefix matches.
+						// Compute the expected gap (i.e. the number of tokens that were dropped during shifting).
+						size_t gap = (embd_inp.size() > session_tokens.size())
+							? embd_inp.size() - session_tokens.size()
+							: 0;
+						// Check the shifted suffix.
+						bool shifted_matches = true;
+						size_t shifted_tokens = session_tokens.size() > n_preserve ? session_tokens.size() - n_preserve : 0;
+						for (size_t i = 0; i < shifted_tokens; i++) {
+							size_t prompt_index = n_preserve + gap + i;
+							if (prompt_index >= embd_inp.size() || embd_inp[prompt_index] != session_tokens[n_preserve + i]) {
+								shifted_matches = false;
+								break;
+							}
+						}
+						if (shifted_matches) {
+							// We can reuse the whole session_tokens.
+							n_matching_session_tokens = session_tokens.size();
+#ifdef DEBUG
+							std::cout << "[INFERENCE] [KV] Matched preserved prefix and shifted suffix." << std::endl;
+#endif
+						}
+						else {
+							// If shifted part doesn't match, fall back to matching as much as possible.
+							for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+								if (embd_inp[i] != session_tokens[i])
+									break;
+								n_matching_session_tokens++;
+							}
+						}
+					}
+				}
+
 #ifdef DEBUG
 				if (n_matching_session_tokens == embd_inp.size()) {
 					std::cout << "[INFERENCE] Session file has an exact match for the prompt." << std::endl;
@@ -524,7 +571,7 @@ namespace
 				}
 #endif
 
-				if (session_tokens.size() > embd_inp.size())
+				if (session_tokens.size() > embd_inp.size() && n_matching_session_tokens > 0)
 				{
 					--n_matching_session_tokens; // always force to re-evaluate the last token
 				}
