@@ -617,7 +617,8 @@ namespace
 				}
 
 				// 2. We have consumed all prompt tokens, so now we generate the model’s output
-				if (n_remain <= 0) {
+				// if maxNewTokens is 0, only stop if we reach an EOS token
+				if (n_remain <= 0 && params.maxNewTokens != 0) {
 					// done generating
 					break;
 				}
