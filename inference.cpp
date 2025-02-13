@@ -547,7 +547,7 @@ namespace
 			int i_prompt	= (int)n_matching_session_tokens;	// how many from embd_inp have been consumed
 
 			// Context Trimming Configuration
-			int n_keep		= 128;
+			int n_keep		= g_params.n_keep;
 
 #ifdef DEBUG
 			std::cout << "[INFERENCE] [COMPLETE] Starting decode loop\n"
@@ -799,14 +799,11 @@ namespace
 			int n_keep,
 			std::vector<llama_token>& session_tokens,
 			int& n_past) {
-			// If we already have n_keep or fewer tokens, no trimming is necessary.
 			if (n_past <= n_keep) {
 				return;
 			}
 
-			// Compute how many tokens are in excess of the keep window.
 			int n_left = n_past - n_keep;
-			// Discard half of the extra tokens.
 			int n_discard = n_left / 2;
 			if (n_discard <= 0) {
 				return;
@@ -819,19 +816,11 @@ namespace
 				<< ", n_discard = " << n_discard << std::endl << std::endl;
 #endif
 
-			// Remove the tokens to be discarded from the KV cache.
-			// Here, key_id = 0 is used (or -1 if your API uses that to denote "all")
-			// and we remove tokens in the range [n_keep, n_keep+n_discard).
 			llama_kv_cache_seq_rm(context, 0, n_keep, n_keep + n_discard);
-
-			// Shift the remaining tokens left by n_discard positions.
 			llama_kv_cache_seq_add(context, 0, n_keep + n_discard, n_past, -n_discard);
 
-			// Update the number of tokens in the cache.
 			n_past -= n_discard;
 
-			// Update the session_tokens vector to match the new cache state.
-			// Erase tokens corresponding to the discarded portion.
 			if (!session_tokens.empty() && session_tokens.size() >= (size_t)(n_keep + n_discard)) {
 				session_tokens.erase(session_tokens.begin() + n_keep,
 					session_tokens.begin() + n_keep + n_discard);
@@ -894,7 +883,8 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 
 	common_params params;
 	params.model						= tokenizer_model_path.string().c_str();
-	params.n_ctx						= 256;
+	params.n_ctx						= 4096;
+	params.n_keep						= 2048;
 	params.use_mlock					= true;
 	params.use_mmap						= false;
 	params.cont_batching				= false;
