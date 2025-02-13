@@ -546,14 +546,8 @@ namespace
 			int n_remain	= params.maxNewTokens;				// generation budget
 			int i_prompt	= (int)n_matching_session_tokens;	// how many from embd_inp have been consumed
 
-			// Grouped Attention (Self-Extend) Configuration
-			int ga_n		= g_params.grp_attn_n;
-			int ga_w		= g_params.grp_attn_w;
-			int ga_i		= 0;	
-
 			// Context Trimming Configuration
 			int n_keep		= 128;
-			int n_discard	= 1;
 
 #ifdef DEBUG
 			std::cout << "[INFERENCE] [COMPLETE] Starting decode loop\n"
@@ -653,7 +647,7 @@ namespace
 						return;
 					}
 
-					std::cout << "\n\n[CONTEXT SHIFT]\n\n";
+					//std::cout << "\n\n[CONTEXT SHIFT]\n\n";
 				}
 
 				// sample the next token
@@ -801,59 +795,46 @@ namespace
 		common_params				g_params;
 		ggml_threadpool*			threadpool;
 
-		// Revised left-trim function with batched recompute
 		void kv_cache_seq_ltrim(llama_context* context,
 			int n_keep,
 			std::vector<llama_token>& session_tokens,
 			int& n_past) {
-			// If we already have n_keep or fewer tokens, no trimming is needed.
+			// If we already have n_keep or fewer tokens, no trimming is necessary.
 			if (n_past <= n_keep) {
 				return;
 			}
 
-			// If we have enough tokens stored to replay, then recompute.
-			if (session_tokens.size() >= (size_t)n_keep) {
-				// Extract the tokens to keep (i.e. the last n_keep tokens).
-				std::vector<llama_token> keptTokens(session_tokens.end() - n_keep, session_tokens.end());
-
-				// Clear the KV cache entirely to remove outdated positional info.
-				llama_kv_cache_clear(context);
-
-				// Replay the kept tokens in batches to rebuild the hidden state.
-				int new_n_past = 0;
-				const int batch_size = 16; // Adjust this batch size as needed.
-				for (size_t i = 0; i < keptTokens.size(); i += batch_size) {
-					int curr_batch_size = std::min((size_t)batch_size, keptTokens.size() - i);
-					if (llama_decode(context, llama_batch_get_one(keptTokens.data() + i, curr_batch_size))) {
-						std::cerr << "Error re-decoding tokens during recompute" << std::endl;
-						// Handle the error as needed (e.g., break or return).
-					}
-					new_n_past += curr_batch_size;
-				}
-				n_past = new_n_past;
-
-				// Update session_tokens to only the kept tokens.
-				session_tokens = keptTokens;
+			// Compute how many tokens are in excess of the keep window.
+			int n_left = n_past - n_keep;
+			// Discard half of the extra tokens.
+			int n_discard = n_left / 2;
+			if (n_discard <= 0) {
+				return;
 			}
-			else {
-				// Fallback: if there aren't enough tokens in session_tokens,
-				// perform the direct shift method.
-				int n_discard = n_past - n_keep;
 
-				// Remove tokens from the KV cache in the range [n_keep, n_keep+n_discard).
-				llama_kv_cache_seq_rm(context, -1, n_keep, n_keep + n_discard);
+#if DEBUG
+			std::cout << "\n\nContext full, shifting: n_past = " << n_past
+				<< ", n_left = " << n_left
+				<< ", n_keep = " << n_keep
+				<< ", n_discard = " << n_discard << std::endl << std::endl;
+#endif
 
-				// Shift the remaining tokens left by n_discard.
-				llama_kv_cache_seq_add(context, -1, n_keep + n_discard, n_past, -n_discard);
+			// Remove the tokens to be discarded from the KV cache.
+			// Here, key_id = 0 is used (or -1 if your API uses that to denote "all")
+			// and we remove tokens in the range [n_keep, n_keep+n_discard).
+			llama_kv_cache_seq_rm(context, 0, n_keep, n_keep + n_discard);
 
-				// Update session_tokens by erasing the tokens that were discarded.
-				if (!session_tokens.empty() && (n_keep + n_discard) <= (int)session_tokens.size()) {
-					session_tokens.erase(session_tokens.begin() + n_keep,
-						session_tokens.begin() + n_keep + n_discard);
-				}
+			// Shift the remaining tokens left by n_discard positions.
+			llama_kv_cache_seq_add(context, 0, n_keep + n_discard, n_past, -n_discard);
 
-				// Update the token count.
-				n_past -= n_discard;
+			// Update the number of tokens in the cache.
+			n_past -= n_discard;
+
+			// Update the session_tokens vector to match the new cache state.
+			// Erase tokens corresponding to the discarded portion.
+			if (!session_tokens.empty() && session_tokens.size() >= (size_t)(n_keep + n_discard)) {
+				session_tokens.erase(session_tokens.begin() + n_keep,
+					session_tokens.begin() + n_keep + n_discard);
 			}
 		}
 	};
@@ -919,7 +900,6 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 	params.cont_batching				= false;
 	params.warmup						= false;
 	params.cpuparams.n_threads			= inferenceThreads;
-	params.n_batch						= 16;
 	//params.flash_attn					= true;
 #if defined(USE_CUDA) || defined(USE_VULKAN)
 	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
