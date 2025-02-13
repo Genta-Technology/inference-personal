@@ -36,6 +36,8 @@ public:
 
 	bool loadModel(const char* engineDir, const int mainGpuId = -1);
 
+	bool unloadModel();
+
 	/**
 	 * @brief Submits a completion job and returns the job ID.
 	 * @param params The parameters for the completion job.
@@ -49,6 +51,13 @@ public:
 	 * @return The ID of the submitted job.
 	 */
 	int submitChatCompletionsJob(const ChatCompletionParameters& params);
+
+	/**
+	 * @brief Stops a job.
+	 * @param job_id The ID of the job to stop.
+	 * @return True if the job was stopped, false otherwise.
+	 */
+	void stopJob(int job_id);
 
 	/**
 	 * @brief Checks if a job is finished.

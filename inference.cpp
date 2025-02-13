@@ -495,19 +495,66 @@ namespace
 
 			size_t n_matching_session_tokens = 0;
 			if (!session_tokens.empty()) {
-				for (llama_token id : session_tokens) {
-					if (n_matching_session_tokens >= embd_inp.size()
-						|| id != embd_inp[n_matching_session_tokens])
-					{
-						break;
-					}
-#ifdef DEBUG
-					std::cout << "[INFERENCE] [KV] Matched token: "
-						<< id << " == " << embd_inp[n_matching_session_tokens] << std::endl;
-#endif
+				const size_t n_preserve = g_params.n_keep;
 
-					n_matching_session_tokens++;
+				if (embd_inp.size() < n_preserve) {
+					for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+						if (embd_inp[i] != session_tokens[i])
+							break;
+						n_matching_session_tokens++;
+					}
 				}
+				else {
+					// First, check the preserved prefix.
+					bool prefix_matches = true;
+					for (size_t i = 0; i < n_preserve; i++) {
+						if (embd_inp[i] != session_tokens[i]) {
+							prefix_matches = false;
+							break;
+						}
+					}
+					if (!prefix_matches) {
+						// Fallback to simple matching from the beginning.
+						for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+							if (embd_inp[i] != session_tokens[i])
+								break;
+							n_matching_session_tokens++;
+						}
+					}
+					else {
+						// The preserved prefix matches.
+						// Compute the expected gap (i.e. the number of tokens that were dropped during shifting).
+						size_t gap = (embd_inp.size() > session_tokens.size())
+							? embd_inp.size() - session_tokens.size()
+							: 0;
+						// Check the shifted suffix.
+						bool shifted_matches = true;
+						size_t shifted_tokens = session_tokens.size() > n_preserve ? session_tokens.size() - n_preserve : 0;
+						for (size_t i = 0; i < shifted_tokens; i++) {
+							size_t prompt_index = n_preserve + gap + i;
+							if (prompt_index >= embd_inp.size() || embd_inp[prompt_index] != session_tokens[n_preserve + i]) {
+								shifted_matches = false;
+								break;
+							}
+						}
+						if (shifted_matches) {
+							// We can reuse the whole session_tokens.
+							n_matching_session_tokens = session_tokens.size();
+#ifdef DEBUG
+							std::cout << "[INFERENCE] [KV] Matched preserved prefix and shifted suffix." << std::endl;
+#endif
+						}
+						else {
+							// If shifted part doesn't match, fall back to matching as much as possible.
+							for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+								if (embd_inp[i] != session_tokens[i])
+									break;
+								n_matching_session_tokens++;
+							}
+						}
+					}
+				}
+
 #ifdef DEBUG
 				if (n_matching_session_tokens == embd_inp.size()) {
 					std::cout << "[INFERENCE] Session file has an exact match for the prompt." << std::endl;
@@ -524,7 +571,7 @@ namespace
 				}
 #endif
 
-				if (session_tokens.size() > embd_inp.size())
+				if (session_tokens.size() > embd_inp.size() && n_matching_session_tokens > 0)
 				{
 					--n_matching_session_tokens; // always force to re-evaluate the last token
 				}
@@ -539,11 +586,15 @@ namespace
 #endif
 			}
 
+
 			int n_past		= (int)n_matching_session_tokens;   // how many tokens are “in” the model’s cache
 			int n_ctx		= llama_n_ctx(context);
 			int n_batch		= g_params.n_batch;					// how many tokens to evaluate at once
 			int n_remain	= params.maxNewTokens;				// generation budget
-			int i_prompt	= (int)n_matching_session_tokens;					// how many from embd_inp have been consumed
+			int i_prompt	= (int)n_matching_session_tokens;	// how many from embd_inp have been consumed
+
+			// Context Trimming Configuration
+			int n_keep		= g_params.n_keep;
 
 #ifdef DEBUG
 			std::cout << "[INFERENCE] [COMPLETE] Starting decode loop\n"
@@ -554,35 +605,56 @@ namespace
 
 			std::vector<llama_token> embd;  // batch of tokens to evaluate
 			
-			while (true) {
+			while (true) 
+			{
+				if (job->cancelRequested.load()) {
+					{
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->errorMessage = "Generation cancelled by user.";
+						job->isFinished = true;
+						job->cv.notify_all();
+					}
+					break;
+				}
+
 				// 1. If we still have prompt tokens left to feed, push them into `embd`:
-				if (i_prompt < (int)embd_inp.size()) {
-					while (i_prompt < (int)embd_inp.size() && (int)embd.size() < n_batch) {
+				if (i_prompt < (int)embd_inp.size()) 
+				{
+					while (i_prompt < (int)embd_inp.size() && (int)embd.size() < n_batch) 
+					{
 						embd.push_back(embd_inp[i_prompt]);
 						++i_prompt;
 					}
 
 					// Evaluate prompt tokens in batch:
-					if (!embd.empty()) {
-						if (n_past + (int)embd.size() > n_ctx) {
-							// out of context
-							std::lock_guard<std::mutex> jobLock(job->mtx);
-							job->hasError = true;
-							job->errorMessage = "Context overflow: prompt too long";
-							job->cv.notify_all();
-							break;
+					if (!embd.empty()) 
+					{
+						if (n_past + (int)embd.size() > n_ctx) 
+						{
+							kv_cache_seq_ltrim(context, n_keep, session_tokens, n_past);
+
+							if (n_past + (int)embd.size() > n_ctx) {
+								std::lock_guard<std::mutex> jobLock(job->mtx);
+								job->hasError = true;
+								job->errorMessage = "Context overflow even after trimming.";
+								job->cv.notify_all();
+								common_sampler_free(sampler);
+								return;
+							}
 						}
 
 						// **Accept** these tokens in the sampler so it accounts them in repetition-penalty, etc.
 						// For prompt tokens, use `accept_grammar = false` in typical llama.cpp usage:
-						for (auto t : embd) {
+						for (auto t : embd) 
+						{
 							common_sampler_accept(sampler, t, /*accept_grammar=*/false);
 						}
 
 						llama_decode(context, llama_batch_get_one(embd.data(), (int)embd.size()));
 						n_past += (int)embd.size();
 
-						if (!path_session.empty()) {
+						if (!path_session.empty()) 
+						{
 							session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
 						}
 
@@ -592,9 +664,38 @@ namespace
 				}
 
 				// 2. We have consumed all prompt tokens, so now we generate the model’s output
-				if (n_remain <= 0) {
+				// if maxNewTokens is 0, only stop if we reach an EOS token
+				if (n_remain <= 0 && params.maxNewTokens != 0) {
 					// done generating
 					break;
+				}
+
+				if (job->cancelRequested.load()) {
+					{
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->errorMessage = "Generation cancelled by user.";
+						job->isFinished = true;
+						job->cv.notify_all();
+					}
+					break;
+				}
+
+
+				// check for context overflow
+				if (n_past + 1 > n_ctx)
+				{
+					kv_cache_seq_ltrim(context, n_keep, session_tokens, n_past);
+
+					if (n_past + 1 > n_ctx) {
+						std::lock_guard<std::mutex> jobLock(job->mtx);
+						job->hasError = true;
+						job->errorMessage = "Context overflow even after trimming.";
+						job->cv.notify_all();
+						common_sampler_free(sampler);
+						return;
+					}
+
+					//std::cout << "\n\n[CONTEXT SHIFT]\n\n";
 				}
 
 				// sample the next token
@@ -602,15 +703,6 @@ namespace
 
 				// accept it into the sampler for subsequent penalty calculations
 				common_sampler_accept(sampler, id, /*accept_grammar=*/true);
-
-				// check for context overflow
-				if (n_past + 1 > n_ctx) {
-					std::lock_guard<std::mutex> jobLock(job->mtx);
-					job->hasError = true;
-					job->errorMessage = "Context overflow while generating";
-					job->cv.notify_all();
-					break;
-				}
 
 				// append this token to `embd`
 				embd.push_back(id);
@@ -750,6 +842,38 @@ namespace
 		std::mutex					mtx;
 		common_params				g_params;
 		ggml_threadpool*			threadpool;
+
+		void kv_cache_seq_ltrim(llama_context* context,
+			int n_keep,
+			std::vector<llama_token>& session_tokens,
+			int& n_past) {
+			if (n_past <= n_keep) {
+				return;
+			}
+
+			int n_left = n_past - n_keep;
+			int n_discard = n_left / 2;
+			if (n_discard <= 0) {
+				return;
+			}
+
+#if DEBUG
+			std::cout << "\n\nContext full, shifting: n_past = " << n_past
+				<< ", n_left = " << n_left
+				<< ", n_keep = " << n_keep
+				<< ", n_discard = " << n_discard << std::endl << std::endl;
+#endif
+
+			llama_kv_cache_seq_rm(context, 0, n_keep, n_keep + n_discard);
+			llama_kv_cache_seq_add(context, 0, n_keep + n_discard, n_past, -n_discard);
+
+			n_past -= n_discard;
+
+			if (!session_tokens.empty() && session_tokens.size() >= (size_t)(n_keep + n_discard)) {
+				session_tokens.erase(session_tokens.begin() + n_keep,
+					session_tokens.begin() + n_keep + n_discard);
+			}
+		}
 	};
 } // namespace
 
@@ -769,6 +893,7 @@ struct InferenceEngine::Impl
 
 	int submitCompletionsJob(const CompletionParameters& params);
 	int submitChatCompletionsJob(const ChatCompletionParameters& params);
+	void stopJob(int job_id);
 	bool isJobFinished(int job_id);
 	CompletionResult getJobResult(int job_id);
 	void waitForJob(int job_id);
@@ -806,8 +931,8 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 
 	common_params params;
 	params.model						= tokenizer_model_path.string().c_str();
-	params.n_ctx						= 8192;
-	params.n_predict					= 4096;
+	params.n_ctx						= 4096;
+	params.n_keep						= 2048;
 	params.use_mlock					= true;
 	params.use_mmap						= false;
 	params.cont_batching				= false;
@@ -933,6 +1058,17 @@ int InferenceEngine::Impl::submitChatCompletionsJob(const ChatCompletionParamete
 	}
 
 	return jobId;
+}
+
+void InferenceEngine::Impl::stopJob(int job_id) {
+	std::lock_guard<std::mutex> lock(jobsMutex);
+	auto it = jobs.find(job_id);
+	if (it != jobs.end()) {
+		it->second->cancelRequested.store(true);
+		// Optionally notify any waiting threads:
+		std::lock_guard<std::mutex> jobLock(it->second->mtx);
+		it->second->cv.notify_all();
+	}
 }
 
 bool InferenceEngine::Impl::isJobFinished(int job_id)
@@ -1066,6 +1202,18 @@ INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int m
 	return true;
 }
 
+INFERENCE_API bool InferenceEngine::unloadModel()
+{
+	if (!this->pimpl)
+	{
+		std::cerr << "[INFERENCE] [ERROR] Model not loaded\n" << std::endl;
+		return false;
+	}
+
+	this->pimpl.reset();
+	return true;
+}
+
 INFERENCE_API int InferenceEngine::submitCompletionsJob(const CompletionParameters& params)
 {
 #ifdef DEBUG
@@ -1082,6 +1230,11 @@ INFERENCE_API int InferenceEngine::submitChatCompletionsJob(const ChatCompletion
 #endif
 
 	return pimpl->submitChatCompletionsJob(params);
+}
+
+INFERENCE_API void InferenceEngine::stopJob(int job_id)
+{
+	pimpl->stopJob(job_id);
 }
 
 INFERENCE_API bool InferenceEngine::isJobFinished(int job_id)

@@ -18,7 +18,7 @@ typedef InferenceEngine* (CreateInferenceEngineFunc)();
 
 int main(int argc, char* argv[])
 {
-	std::string modelPath = "C:\\Users\\rifky\\OneDrive\\Documents\\GitHub\\kolosal\\out\\build\\x64-Release-Debug\\models\\deepseek-r1-qwen-1.5b\\int4";
+	std::string modelPath = "C:\\Users\\rifky\\OneDrive\\Documents\\GitHub\\kolosal\\out\\build\\x64-Release-Debug\\models\\llama-3.2-1B\\int4";
 	
 #ifdef USE_VULKAN
 	std::string libraryName = "InferenceEngineLibVulkan.dll";
@@ -52,8 +52,8 @@ int main(int argc, char* argv[])
 		// Prepare chat completion parameters
 		ChatCompletionParameters chatParams;
 		chatParams.messages = {
-			{"user", "Jelaskan wololo secara detail"} };
-		chatParams.maxNewTokens = 32;
+			{"user", "Jelaskan dengan detail kenapa 1 + 1 = 2? dan kenapa x^0 = 1?"} };
+		chatParams.maxNewTokens = 512;
 		chatParams.kvCacheFilePath = "kv_cache.bin";
 
 		// Perform chat completion
