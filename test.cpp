@@ -53,7 +53,7 @@ int main(int argc, char* argv[])
 		ChatCompletionParameters chatParams;
 		chatParams.messages = {
 			{"user", "Jelaskan dengan detail kenapa 1 + 1 = 2? dan kenapa x^0 = 1?"} };
-		chatParams.maxNewTokens = 512;
+		chatParams.maxNewTokens = 128;
 		chatParams.kvCacheFilePath = "kv_cache.bin";
 
 		// Perform chat completion

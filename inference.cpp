@@ -359,6 +359,7 @@ namespace
 
 		void complete(const CompletionParameters& params, std::shared_ptr<Job> job) override
 		{
+			llama_kv_cache_clear(context);
 #ifdef DEBUG
 			std::cout << "[INFERENCE] [COMPLETE] Starting completion" << std::endl;
 
@@ -382,6 +383,7 @@ namespace
 				job->hasError = true;
 				job->errorMessage = "Invalid completion parameters";
 				job->cv.notify_all();
+				llama_kv_cache_clear(context);
 				return;
 			}
 
@@ -404,6 +406,8 @@ namespace
 				job->hasError = true;
 				job->errorMessage = "Could not initialize sampler";
 				job->cv.notify_all();
+				common_sampler_free(sampler);
+				llama_kv_cache_clear(context);
 				return;
 			}
 
@@ -445,6 +449,7 @@ namespace
 						job->errorMessage = "Failed to load session file: " + path_session;
 						job->cv.notify_all();
 						common_sampler_free(sampler);
+						llama_kv_cache_clear(context);
 						return;
 					}
 
@@ -489,6 +494,8 @@ namespace
 					job->hasError = true;
 					job->errorMessage = "Empty prompt and no BOS token available.";
 					job->cv.notify_all();
+					common_sampler_free(sampler);
+					llama_kv_cache_clear(context);
 					return;
 				}
 			}
@@ -613,6 +620,8 @@ namespace
 						job->errorMessage = "Generation cancelled by user.";
 						job->isFinished = true;
 						job->cv.notify_all();
+						common_sampler_free(sampler);
+						llama_kv_cache_clear(context);
 					}
 					break;
 				}
@@ -639,6 +648,7 @@ namespace
 								job->errorMessage = "Context overflow even after trimming.";
 								job->cv.notify_all();
 								common_sampler_free(sampler);
+								llama_kv_cache_clear(context);
 								return;
 							}
 						}
@@ -676,6 +686,8 @@ namespace
 						job->errorMessage = "Generation cancelled by user.";
 						job->isFinished = true;
 						job->cv.notify_all();
+						common_sampler_free(sampler);
+						llama_kv_cache_clear(context);
 					}
 					break;
 				}
@@ -692,6 +704,7 @@ namespace
 						job->errorMessage = "Context overflow even after trimming.";
 						job->cv.notify_all();
 						common_sampler_free(sampler);
+						llama_kv_cache_clear(context);
 						return;
 					}
 
@@ -713,6 +726,8 @@ namespace
 					job->hasError = true;
 					job->errorMessage = "Could not decode next token";
 					job->cv.notify_all();
+					common_sampler_free(sampler);
+					llama_kv_cache_clear(context);
 					break;
 				}
 				n_past += 1;
@@ -931,6 +946,7 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 
 	common_params params;
 	params.model						= tokenizer_model_path.string().c_str();
+	params.n_predict                    = 1;
 	params.n_ctx						= 4096;
 	params.n_keep						= 2048;
 	params.use_mlock					= true;
@@ -938,7 +954,7 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 	params.cont_batching				= false;
 	params.warmup						= false;
 	params.cpuparams.n_threads			= inferenceThreads;
-	//params.flash_attn					= true;
+
 #if defined(USE_CUDA) || defined(USE_VULKAN)
 	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
 
