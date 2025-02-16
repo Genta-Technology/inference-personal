@@ -1,7 +1,3 @@
-# InferenceEngine
-
-A lightweight inference engine that integrates with [llama.cpp](https://github.com/ggml-org/llama.cpp) for efficient model execution.
-
 ## 🚀 Setup
 
 To ensure compatibility, this project uses **llama.cpp version b4514**``.
