@@ -5,7 +5,8 @@ To ensure compatibility, this project uses **llama.cpp version b4514**``.
 ### 1️⃣ Clone the Repository
 
 ```sh
-cd /path/to/github/directory
+git clone https://github.com/genta-technology/inference-personal
+cd inference-personal
 ```
 
 ### 2️⃣ Setup `llama.cpp`
