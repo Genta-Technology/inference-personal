@@ -417,45 +417,15 @@ namespace
 			std::string path_session = params.kvCacheFilePath;
 			std::vector<llama_token> session_tokens;  // The tokens we previously saved
 
-			if (!path_session.empty()) {
-				// Attempt to load
-				if (!std::filesystem::exists(path_session)) {
-					// file doesn't exist => no old cache
-					printf("[KV] session file does not exist, will create.\n");
-				}
-				else if (std::filesystem::is_empty(path_session)) {
-					// file is empty => treat as brand-new
-					printf("[KV] session file is empty, new session.\n");
-				}
-				else {
-					// The file exists and is not empty
-					session_tokens.resize(g_params.n_ctx);  // allocate buffer
-					size_t n_token_count_out = 0;
-
-					if (!llama_state_load_file(
-						context,
-						path_session.c_str(),
-						session_tokens.data(),
-						session_tokens.capacity(),
-						&n_token_count_out
-					)) {
-						// If load fails, handle error
-						std::lock_guard<std::mutex> jobLock(job->mtx);
-						job->hasError = true;
-						job->errorMessage = "Failed to load session file: " + path_session;
-						job->cv.notify_all();
-						common_sampler_free(sampler);
-						return;
-					}
-
-					// The llama_state_load_file call gives us how many tokens were in that old session
-					session_tokens.resize(n_token_count_out);
-
-#ifdef DEBUG
-					printf("[INFERENCE] [KV] loaded session with prompt size: %d tokens\n", (int)session_tokens.size());
-					printf("[INFERENCE] [KV] tokens decoded: %s", tokenizer->detokenize(session_tokens).c_str());
-#endif
-				}
+			if (!load_kv_cache(path_session, session_tokens))
+			{
+				std::lock_guard<std::mutex> jobLock(job->mtx);
+				job->hasError = true;
+				job->errorMessage = "Could not load KV cache from " + path_session;
+				job->cv.notify_all();
+				common_sampler_free(sampler);
+				llama_kv_cache_clear(context);
+				return;
 			}
 
 #ifdef DEBUG
@@ -463,7 +433,8 @@ namespace
 #endif
 
 			std::vector<llama_token> embd_inp;  // "embedding input"
-			if (session_tokens.empty() || !params.prompt.empty()) {
+			if (session_tokens.empty() || !params.prompt.empty()) 
+			{
 				// If the session cache is empty OR we have a brand new prompt,
 				// we tokenize from scratch.
 #ifdef DEBUG
@@ -471,7 +442,8 @@ namespace
 #endif
 				embd_inp = tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
 			}
-			else {
+			else 
+			{
 #ifdef DEBUG
 				std::cout << "[INFERENCE] Reusing session tokens from disk" << std::endl;
 #endif
@@ -479,12 +451,15 @@ namespace
 				embd_inp = session_tokens;
 			}
 
-			if (embd_inp.empty()) {
+			if (embd_inp.empty()) 
+			{
 				// Attempt to add BOS if configured
-				if (tokenizer->shouldAddBos()) {
+				if (tokenizer->shouldAddBos()) 
+				{
 					embd_inp.push_back(llama_token_bos(tokenizer->getVocab()));
 				}
-				else {
+				else 
+				{
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 					job->hasError = true;
 					job->errorMessage = "Empty prompt and no BOS token available.";
@@ -493,99 +468,7 @@ namespace
 				}
 			}
 
-			size_t n_matching_session_tokens = 0;
-			if (!session_tokens.empty()) {
-				const size_t n_preserve = g_params.n_keep;
-
-				if (embd_inp.size() < n_preserve) {
-					for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
-						if (embd_inp[i] != session_tokens[i])
-							break;
-						n_matching_session_tokens++;
-					}
-				}
-				else {
-					// First, check the preserved prefix.
-					bool prefix_matches = true;
-					for (size_t i = 0; i < n_preserve; i++) {
-						if (embd_inp[i] != session_tokens[i]) {
-							prefix_matches = false;
-							break;
-						}
-					}
-					if (!prefix_matches) {
-						// Fallback to simple matching from the beginning.
-						for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
-							if (embd_inp[i] != session_tokens[i])
-								break;
-							n_matching_session_tokens++;
-						}
-					}
-					else {
-						// The preserved prefix matches.
-						// Compute the expected gap (i.e. the number of tokens that were dropped during shifting).
-						size_t gap = (embd_inp.size() > session_tokens.size())
-							? embd_inp.size() - session_tokens.size()
-							: 0;
-						// Check the shifted suffix.
-						bool shifted_matches = true;
-						size_t shifted_tokens = session_tokens.size() > n_preserve ? session_tokens.size() - n_preserve : 0;
-						for (size_t i = 0; i < shifted_tokens; i++) {
-							size_t prompt_index = n_preserve + gap + i;
-							if (prompt_index >= embd_inp.size() || embd_inp[prompt_index] != session_tokens[n_preserve + i]) {
-								shifted_matches = false;
-								break;
-							}
-						}
-						if (shifted_matches) {
-							// We can reuse the whole session_tokens.
-							n_matching_session_tokens = session_tokens.size();
-#ifdef DEBUG
-							std::cout << "[INFERENCE] [KV] Matched preserved prefix and shifted suffix." << std::endl;
-#endif
-						}
-						else {
-							// If shifted part doesn't match, fall back to matching as much as possible.
-							for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
-								if (embd_inp[i] != session_tokens[i])
-									break;
-								n_matching_session_tokens++;
-							}
-						}
-					}
-				}
-
-#ifdef DEBUG
-				if (n_matching_session_tokens == embd_inp.size()) {
-					std::cout << "[INFERENCE] Session file has an exact match for the prompt." << std::endl;
-				}
-				else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
-					std::cout << "[INFERENCE] Session file has low similarity to prompt ("
-						<< n_matching_session_tokens << " / " << embd_inp.size()
-						<< "); will mostly be re-evaluated." << std::endl;
-				}
-				else {
-					std::cout << "[INFERENCE] Session file matches "
-						<< n_matching_session_tokens << " / "
-						<< embd_inp.size() << " tokens of prompt." << std::endl;
-				}
-#endif
-
-				if (session_tokens.size() > embd_inp.size() && n_matching_session_tokens > 0)
-				{
-					--n_matching_session_tokens; // always force to re-evaluate the last token
-				}
-
-				// Remove any "future" tokens that don’t match
-				// i.e. we only keep the portion that matched
-				llama_kv_cache_seq_rm(context, -1 /*any key_id*/, n_matching_session_tokens, -1 /*up to end*/);
-				session_tokens.resize(n_matching_session_tokens);
-#ifdef DEBUG
-				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(session_tokens.size() - n_matching_session_tokens));
-				printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
-#endif
-			}
-
+			size_t n_matching_session_tokens = match_kv_cache(session_tokens, embd_inp);
 
 			int n_past		= (int)n_matching_session_tokens;   // how many tokens are “in” the model’s cache
 			int n_ctx		= llama_n_ctx(context);
@@ -607,13 +490,14 @@ namespace
 			
 			while (true) 
 			{
-				if (job->cancelRequested.load()) {
-					{
-						std::lock_guard<std::mutex> jobLock(job->mtx);
-						job->errorMessage = "Generation cancelled by user.";
-						job->isFinished = true;
-						job->cv.notify_all();
-					}
+				if (job->cancelRequested.load()) 
+				{
+					std::lock_guard<std::mutex> jobLock(job->mtx);
+					job->errorMessage = "Generation cancelled by user.";
+					job->isFinished = true;
+					job->cv.notify_all();
+					common_sampler_free(sampler);
+					llama_kv_cache_clear(context);
 					break;
 				}
 
@@ -695,7 +579,9 @@ namespace
 						return;
 					}
 
-					//std::cout << "\n\n[CONTEXT SHIFT]\n\n";
+#ifdef DEBUG
+					std::cout << "\n\n[CONTEXT SHIFT]\n\n";
+#endif
 				}
 
 				// sample the next token
@@ -842,6 +728,150 @@ namespace
 		std::mutex					mtx;
 		common_params				g_params;
 		ggml_threadpool*			threadpool;
+
+		bool load_kv_cache(const std::string& path, std::vector<llama_token>& session_tokens)
+		{
+			if (!path.empty()) 
+			{
+				// Attempt to load
+				if (!std::filesystem::exists(path)) 
+				{
+					// file doesn't exist => no old cache
+					printf("[KV] session file does not exist, will create.\n");
+				}
+				else if (std::filesystem::is_empty(path)) 
+				{
+					// file is empty => treat as brand-new
+					printf("[KV] session file is empty, new session.\n");
+				}
+				else 
+				{
+					// The file exists and is not empty
+					session_tokens.resize(g_params.n_ctx);  // allocate buffer
+					size_t n_token_count_out = 0;
+
+					if (!llama_state_load_file(
+						context,
+						path.c_str(),
+						session_tokens.data(),
+						session_tokens.capacity(),
+						&n_token_count_out
+					)) 
+					{
+						return false;
+					}
+
+					// The llama_state_load_file call gives us how many tokens were in that old session
+					session_tokens.resize(n_token_count_out);
+
+#ifdef DEBUG
+					printf("[INFERENCE] [KV] loaded session with prompt size: %d tokens\n", (int)session_tokens.size());
+					printf("[INFERENCE] [KV] tokens decoded: %s", tokenizer->detokenize(session_tokens).c_str());
+#endif
+				}
+			}
+		}
+
+		int match_kv_cache(std::vector<llama_token>& session_tokens, const std::vector<llama_token>& embd_inp)
+		{
+			size_t n_matching_session_tokens = 0;
+
+			if (!session_tokens.empty()) {
+				const size_t n_preserve = g_params.n_keep;
+
+				if (embd_inp.size() < n_preserve) {
+					for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+						if (embd_inp[i] != session_tokens[i])
+							break;
+						n_matching_session_tokens++;
+					}
+				}
+				else {
+					// First, check the preserved prefix.
+					bool prefix_matches = true;
+					for (size_t i = 0; i < n_preserve; i++) {
+						if (embd_inp[i] != session_tokens[i]) {
+							prefix_matches = false;
+							break;
+						}
+					}
+					if (!prefix_matches) {
+						// Fallback to simple matching from the beginning.
+						for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+							if (embd_inp[i] != session_tokens[i])
+								break;
+							n_matching_session_tokens++;
+						}
+					}
+					else {
+						// The preserved prefix matches.
+						// Compute the expected gap (i.e. the number of tokens that were dropped during shifting).
+						size_t gap = (embd_inp.size() > session_tokens.size())
+							? embd_inp.size() - session_tokens.size()
+							: 0;
+						// Check the shifted suffix.
+						bool shifted_matches = true;
+						size_t shifted_tokens = session_tokens.size() > n_preserve ? session_tokens.size() - n_preserve : 0;
+						for (size_t i = 0; i < shifted_tokens; i++) {
+							size_t prompt_index = n_preserve + gap + i;
+							if (prompt_index >= embd_inp.size() || embd_inp[prompt_index] != session_tokens[n_preserve + i]) {
+								shifted_matches = false;
+								break;
+							}
+						}
+						if (shifted_matches) {
+							// We can reuse the whole session_tokens.
+							n_matching_session_tokens = session_tokens.size();
+#ifdef DEBUG
+							std::cout << "[INFERENCE] [KV] Matched preserved prefix and shifted suffix." << std::endl;
+#endif
+						}
+						else {
+							// If shifted part doesn't match, fall back to matching as much as possible.
+							for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
+								if (embd_inp[i] != session_tokens[i])
+									break;
+								n_matching_session_tokens++;
+							}
+						}
+					}
+				}
+
+#ifdef DEBUG
+				if (n_matching_session_tokens == embd_inp.size()) {
+					std::cout << "[INFERENCE] Session file has an exact match for the prompt." << std::endl;
+				}
+				else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
+					std::cout << "[INFERENCE] Session file has low similarity to prompt ("
+						<< n_matching_session_tokens << " / " << embd_inp.size()
+						<< "); will mostly be re-evaluated." << std::endl;
+				}
+				else {
+					std::cout << "[INFERENCE] Session file matches "
+						<< n_matching_session_tokens << " / "
+						<< embd_inp.size() << " tokens of prompt." << std::endl;
+				}
+#endif
+
+				if (session_tokens.size() > embd_inp.size() && n_matching_session_tokens > 0)
+				{
+					--n_matching_session_tokens; // always force to re-evaluate the last token
+				}
+
+				// Remove any "future" tokens that don’t match
+				// i.e. we only keep the portion that matched
+				llama_kv_cache_seq_rm(context, -1 /*any key_id*/, n_matching_session_tokens, -1 /*up to end*/);
+				session_tokens.resize(n_matching_session_tokens);
+#ifdef DEBUG
+				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(session_tokens.size() - n_matching_session_tokens));
+				printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
+#endif
+
+				return true;
+			}
+
+			return false;
+		}
 
 		void kv_cache_seq_ltrim(llama_context* context,
 			int n_keep,

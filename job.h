@@ -20,6 +20,9 @@ struct Job {
     std::string errorMessage;
     float tps = 0;
     std::atomic<bool> cancelRequested{ false };
+    llama_seq_id seq_id = -1;
+    int32_t n_prompt = 0;
+    int32_t n_decoded = 0;
 };
 
 #endif // JOB_H
