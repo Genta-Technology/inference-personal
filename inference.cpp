@@ -408,10 +408,10 @@ namespace
 						continue;
 					}
 
-					if (!job->isDecodingPrompt) {
-						if (!ensureContextCapacity(job))
-							continue;
+					if (!ensureContextCapacity(job))
+						continue;
 
+					if (!job->isDecodingPrompt) {
 						if (!sampleNextToken(job)) {
 							saveSession(job);
 							common_sampler_free(job->smpl);
@@ -428,10 +428,12 @@ namespace
 						while (job->i_prompt < job->embd_inp.size()) {
 							common_batch_add(batch, job->embd_inp[job->i_prompt], job->i_prompt, { job->jobId }, true);
 							common_sampler_accept(job->smpl, job->embd_inp[job->i_prompt], false);
+							job->session_tokens.push_back(job->embd_inp[job->i_prompt]);
 							++(job->i_prompt);
 							batch_has_tokens = true;
 						}
 
+						batch_has_tokens = true;
 						job->n_past += job->n_prompt;
 						job->isDecodingPrompt = false;
 					}
@@ -480,14 +482,14 @@ namespace
 				common_sampler_free(job->smpl);
 				return;
 			}
-
+			
 			job->embd_inp = getInputTokens(params, job->session_tokens);
 			if (!ensureNonEmptyInput(job)) {
 				common_sampler_free(job->smpl);
 				return;
 			}
 
-			job->n_matching_session_tokens	= matchSessionTokens(job->session_tokens, job->embd_inp);
+			job->n_matching_session_tokens	= matchSessionTokens(job->session_tokens, job->embd_inp, job->jobId);
 			job->n_past						= static_cast<int>(job->n_matching_session_tokens);
 			job->n_remain					= params.maxNewTokens;
 			job->i_prompt					= static_cast<int>(job->n_matching_session_tokens);
@@ -692,7 +694,7 @@ namespace
 
 		bool ensureContextCapacity(int n_past, int n_tokens_to_add, int n_ctx, int n_keep, std::vector<llama_token>& session_tokens, std::shared_ptr<Job> job) {
 			if (n_past + n_tokens_to_add > n_ctx) {
-				kv_cache_seq_ltrim(context, n_keep, session_tokens, n_past);
+				kv_cache_seq_ltrim(context, n_keep, session_tokens, n_past, job->jobId);
 				if (n_past + n_tokens_to_add > n_ctx) {
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 					job->hasError = true;
@@ -853,13 +855,13 @@ namespace
 
 #ifdef DEBUG
 					printf("[INFERENCE] [KV] loaded session with prompt size: %d tokens\n", (int)session_tokens.size());
-					printf("[INFERENCE] [KV] tokens decoded: %s", tokenizer->detokenize(session_tokens).c_str());
+					printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
 #endif
 				}
 			}
 		}
 
-		size_t matchSessionTokens(std::vector<llama_token>& session_tokens, const std::vector<llama_token>& embd_inp, const int id = -1)
+		size_t matchSessionTokens(std::vector<llama_token>& session_tokens, const std::vector<llama_token>& embd_inp, const int id = 0)
 		{
 			size_t n_matching_session_tokens = 0;
 
@@ -872,6 +874,9 @@ namespace
 							break;
 						n_matching_session_tokens++;
 					}
+
+					std::cout << "Embedded input size: " << embd_inp.size() << std::endl;
+					std::cout << "n_matching_session_tokens: " << n_matching_session_tokens << std::endl;
 				}
 				else {
 					// First, check the preserved prefix.
@@ -953,14 +958,12 @@ namespace
 				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(session_tokens.size() - n_matching_session_tokens));
 				printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
 #endif
-
-				return true;
 			}
 
-			return false;
+			return n_matching_session_tokens;
 		}
 
-		void kv_cache_seq_ltrim(llama_context* context, int n_keep, std::vector<llama_token>& session_tokens, int& n_past, int id = 0) {
+		void kv_cache_seq_ltrim(llama_context* context, int n_keep, std::vector<llama_token>& session_tokens, int& n_past, const int id) {
 			if (n_past <= n_keep) {
 				return;
 			}
