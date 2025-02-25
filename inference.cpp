@@ -53,7 +53,7 @@ private:
 
 inline ThreadPool::ThreadPool() : stop(false)
 {
-	size_t num_threads = 1;
+	size_t num_threads = 4;
 
 #ifdef DEBUG
 	std::cout << "[INFERENCE] Creating thread pool with " << num_threads << " threads" << std::endl;
@@ -355,7 +355,7 @@ namespace
 			std::cout << "Initializing batch with size of: " << g_params.n_batch << std::endl;
 #endif
 
-			batch = llama_batch_init(params.n_ctx, 0, g_params.n_batch);
+			batch = llama_batch_init(params.n_ctx, 0, 1);
 
 			std::thread inferenceThread(&LlamaInferenceService::start, this);
 			inferenceThread.detach();
@@ -425,17 +425,18 @@ namespace
 						batch_has_tokens = true;
 					}
 					else {
-						while (job->i_prompt < job->embd_inp.size()) {
-							common_batch_add(batch, job->embd_inp[job->i_prompt], job->i_prompt, { job->jobId }, true);
-							common_sampler_accept(job->smpl, job->embd_inp[job->i_prompt], false);
-							job->session_tokens.push_back(job->embd_inp[job->i_prompt]);
+						if (job->i_prompt < job->n_prompt) {
+							llama_token token = job->embd_inp[job->i_prompt];
+							common_batch_add(batch, token, job->i_prompt, { job->jobId }, true);
+							common_sampler_accept(job->smpl, token, false);
+							job->session_tokens.push_back(token);
 							++(job->i_prompt);
+							++(job->n_past);
 							batch_has_tokens = true;
 						}
-
-						batch_has_tokens = true;
-						job->n_past += job->n_prompt;
-						job->isDecodingPrompt = false;
+						else {
+							job->isDecodingPrompt = false;
+						}
 					}
 				}
 
@@ -874,9 +875,6 @@ namespace
 							break;
 						n_matching_session_tokens++;
 					}
-
-					std::cout << "Embedded input size: " << embd_inp.size() << std::endl;
-					std::cout << "n_matching_session_tokens: " << n_matching_session_tokens << std::endl;
 				}
 				else {
 					// First, check the preserved prefix.
