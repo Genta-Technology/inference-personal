@@ -402,7 +402,7 @@ namespace
 					if (checkCancellation(job) || (job->n_remain <= 0 && job->params.maxNewTokens != 0)) {
 						saveSession(job);
 						common_sampler_free(job->smpl);
-						llama_kv_cache_seq_rm(context, 0, 0, -1);
+						llama_kv_cache_seq_rm(context, job->jobId, 0, -1);
 						job->isFinished = true;
 						job->cv.notify_all();
 						continue;
@@ -415,7 +415,7 @@ namespace
 						if (!sampleNextToken(job)) {
 							saveSession(job);
 							common_sampler_free(job->smpl);
-							llama_kv_cache_seq_rm(context, 0, 0, -1);
+							llama_kv_cache_seq_rm(context, job->jobId, 0, -1);
 							job->isFinished = true;
 							job->cv.notify_all();
 							continue;
@@ -426,7 +426,7 @@ namespace
 					}
 					else {
 						while (job->i_prompt < job->embd_inp.size()) {
-							common_batch_add(batch, job->embd_inp[job->i_prompt], job->i_prompt, { 0 }, true);
+							common_batch_add(batch, job->embd_inp[job->i_prompt], job->i_prompt, { job->jobId }, true);
 							common_sampler_accept(job->smpl, job->embd_inp[job->i_prompt], false);
 							++(job->i_prompt);
 							batch_has_tokens = true;
@@ -678,7 +678,7 @@ namespace
 
 		bool ensureContextCapacity(std::shared_ptr<Job> job) {
 			if (job->n_past + 1 > n_ctx) {
-				kv_cache_seq_ltrim(context, n_keep, job->session_tokens, job->n_past, 0);
+				kv_cache_seq_ltrim(context, n_keep, job->session_tokens, job->n_past, job->jobId);
 				if (job->n_past + 1 > n_ctx) {
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 					job->hasError = true;
@@ -718,7 +718,7 @@ namespace
 		bool processPromptTokens(std::shared_ptr<Job> job)
 		{
 			while (job->i_prompt < job->embd_inp.size()) {
-				common_batch_add(batch, job->embd_inp[job->i_prompt], job->i_prompt, { 0 }, true);
+				common_batch_add(batch, job->embd_inp[job->i_prompt], job->i_prompt, { job->jobId }, true);
 				common_sampler_accept(job->smpl, job->embd_inp[job->i_prompt], false);
 				++(job->i_prompt);
 			}
@@ -752,7 +752,7 @@ namespace
 		}
 
 		bool sampleNextToken(common_sampler* sampler, int& n_past, int& n_remain, std::vector<llama_token>& session_tokens, std::shared_ptr<Job> job, const std::string& path_session) {
-			llama_token id = common_sampler_sample(sampler, context, 0);
+			llama_token id = common_sampler_sample(sampler, context, job->jobId);
 			common_sampler_accept(sampler, id, true);
 			common_batch_add(batch, id, n_past, { 0 }, true);
 
@@ -778,9 +778,9 @@ namespace
 		}
 
 		bool sampleNextToken(std::shared_ptr<Job> job) {
-			llama_token id = common_sampler_sample(job->smpl, context, 0);
+			llama_token id = common_sampler_sample(job->smpl, context, job->jobId);
 			common_sampler_accept(job->smpl, id, false);
-			common_batch_add(batch, id, job->n_past, { 0 }, true);
+			common_batch_add(batch, id, job->n_past, { job->jobId }, true);
 
 			if (llama_token_is_eog(tokenizer->getVocab(), id) || id == llama_token_eos(tokenizer->getVocab())) {
 				return false; // Stop generation
