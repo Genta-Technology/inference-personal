@@ -1,4 +1,4 @@
-#include <filesystem>
+﻿#include <filesystem>
 #include <stdexcept>
 #include <iostream>
 #include <queue>
@@ -12,6 +12,7 @@
 #endif
 
 #include "llama.h"
+#include "llama-context.h"
 #include "common.h"
 #include "sampling.h"
 #include "inference.h"
@@ -355,7 +356,7 @@ namespace
 			std::cout << "Initializing batch with size of: " << g_params.n_batch << std::endl;
 #endif
 
-			batch = llama_batch_init(params.n_ctx, 0, 1);
+			batch = llama_batch_init(params.n_ctx, 0, 8);
 
 			std::thread inferenceThread(&LlamaInferenceService::start, this);
 			inferenceThread.detach();
@@ -425,18 +426,24 @@ namespace
 						batch_has_tokens = true;
 					}
 					else {
-						if (job->i_prompt < job->n_prompt) {
+						while (job->i_prompt < job->n_prompt) {
 							llama_token token = job->embd_inp[job->i_prompt];
-							common_batch_add(batch, token, job->i_prompt, { job->jobId }, true);
+							common_batch_add(batch, token, job->i_prompt, { job->jobId }, false);
+							if (job->i_prompt == job->n_prompt - 1)
+							{
+								batch.logits[batch.n_tokens - 1] = true;
+								job->batch_pos = batch.n_tokens - 1;
+							}
+
 							common_sampler_accept(job->smpl, token, false);
 							job->session_tokens.push_back(token);
 							++(job->i_prompt);
-							++(job->n_past);
 							batch_has_tokens = true;
 						}
-						else {
-							job->isDecodingPrompt = false;
-						}
+
+						batch_has_tokens = true;
+						job->n_past += job->n_prompt;
+						job->isDecodingPrompt = false;
 					}
 				}
 
@@ -453,7 +460,11 @@ namespace
 							}
 						}
 					}
+#ifdef DEBUG
+					//printLogits(context);
 
+					std::cout << batch.n_tokens << " | " << context->n_outputs << " | " << context->logits_size << std::endl;
+#endif
 					common_batch_clear(batch);
 				}
 			}
@@ -547,8 +558,8 @@ namespace
 
 	private:
 		std::shared_ptr<Tokenizer>			tokenizer;
-		llama_model*						model;
-		llama_context*						context;
+		struct llama_model*					model;
+		struct llama_context*				context;
 		std::mutex							mtx;
 		std::condition_variable				cv;
 		common_params						g_params;
@@ -561,6 +572,81 @@ namespace
 		const int n_batch;
 		const int n_keep;
 		const int n_ctx;
+
+#ifdef DEBUG
+		void printLogits(llama_context* ctx, size_t maxLogits = 10) {
+			// Get the logits after decoding
+			float* logits = llama_get_logits_ith(ctx, -1);
+
+			// Get vocabulary size (number of logits)
+			const int n_vocab = llama_n_vocab(tokenizer->getVocab());
+
+			std::cout << "\n----- Logits after decoding -----\n";
+
+			// Calculate some statistics
+			float min_logit = std::numeric_limits<float>::max();
+			float max_logit = std::numeric_limits<float>::lowest();
+			float sum_logit = 0.0f;
+
+			for (int i = 0; i < n_vocab; i++) {
+				min_logit = std::min(min_logit, logits[i]);
+				max_logit = std::max(max_logit, logits[i]);
+				sum_logit += logits[i];
+			}
+
+			float mean_logit = sum_logit / n_vocab;
+
+			std::cout << "Vocab size: " << n_vocab << std::endl;
+			std::cout << "Min logit: " << min_logit << std::endl;
+			std::cout << "Max logit: " << max_logit << std::endl;
+			std::cout << "Mean logit: " << mean_logit << std::endl;
+
+			// Create vector of (token, logit) pairs for sorting
+			std::vector<std::pair<int, float>> token_logits;
+			for (int i = 0; i < n_vocab; i++) {
+				token_logits.push_back({ i, logits[i] });
+			}
+
+			// Sort by logit value in descending order
+			std::sort(token_logits.begin(), token_logits.end(),
+				[](const auto& a, const auto& b) { return a.second > b.second; });
+
+			// Print top N tokens with highest logits
+			std::cout << "\nTop " << maxLogits << " tokens:\n";
+			std::cout << "|--------|------------|---------------------------------|\n";
+			std::cout << "| Token  │ Logit      │ Text                            │\n";
+			std::cout << "|--------|------------|---------------------------------|\n";
+
+			for (size_t i = 0; i < std::min(maxLogits, token_logits.size()); i++) {
+				int token_id = token_logits[i].first;
+				float token_logit = token_logits[i].second;
+
+				// Get the token text (you'll need to adapt this based on your tokenizer implementation)
+				std::string token_text = tokenizer->decode(token_id);
+
+				// Escape special characters for display
+				std::string escaped_text = "";
+				for (char c : token_text) {
+					if (c == '\n') escaped_text += "\\n";
+					else if (c == '\r') escaped_text += "\\r";
+					else if (c == '\t') escaped_text += "\\t";
+					else if (c < 32 || c > 126) escaped_text += "·";
+					else escaped_text += c;
+				}
+
+				// Truncate if too long
+				if (escaped_text.length() > 31) {
+					escaped_text = escaped_text.substr(0, 28) + "...";
+				}
+
+				std::cout << "| " << std::setw(6) << token_id << " | "
+					<< std::setw(10) << std::fixed << std::setprecision(6) << token_logit << " | "
+					<< std::left << std::setw(31) << escaped_text << " |\n";
+			}
+
+			std::cout << "|--------|------------|---------------------------------|\n";
+		}
+#endif
 
 		int getNextJobId() {
 			return next_job_id++;
@@ -583,12 +669,7 @@ namespace
 			sparams.temp = params.temperature;
 			sparams.seed = params.randomSeed;
 			// sparams.top_k = params.topK;
-
-#ifdef DEBUG
 			sparams.no_perf = false;
-#else
-			sparams.no_perf = true;
-#endif
 
 			common_sampler* sampler = common_sampler_init(model, sparams);
 			if (!sampler) {
@@ -755,7 +836,7 @@ namespace
 		}
 
 		bool sampleNextToken(common_sampler* sampler, int& n_past, int& n_remain, std::vector<llama_token>& session_tokens, std::shared_ptr<Job> job, const std::string& path_session) {
-			llama_token id = common_sampler_sample(sampler, context, job->jobId);
+			llama_token id = common_sampler_sample(sampler, context, -1);
 			common_sampler_accept(sampler, id, true);
 			common_batch_add(batch, id, n_past, { 0 }, true);
 
@@ -781,7 +862,13 @@ namespace
 		}
 
 		bool sampleNextToken(std::shared_ptr<Job> job) {
-			llama_token id = common_sampler_sample(job->smpl, context, job->jobId);
+#ifdef DEBUG
+			std::cout << "[INFERENCE] [DECODING] job id: " << job->jobId << std::endl;
+			std::cout << "[INFERENCE] [DECODING] n outputs: " << context->n_outputs << std::endl;
+			std::cout << "[INFERENCE] [DECODING] n batch: " << batch.n_tokens << std::endl;
+#endif
+
+			llama_token id = common_sampler_sample(job->smpl, context, job->batch_pos);
 			common_sampler_accept(job->smpl, id, false);
 			common_batch_add(batch, id, job->n_past, { job->jobId }, true);
 
@@ -803,6 +890,7 @@ namespace
 			}
 
 			job->n_remain -= 1;
+			job->batch_pos = batch.n_tokens - 1;
 
 			return true;
 		}
@@ -948,7 +1036,7 @@ namespace
 					--n_matching_session_tokens; // always force to re-evaluate the last token
 				}
 
-				// Remove any "future" tokens that don�t match
+				// Remove any "future" tokens that don’t match
 				// i.e. we only keep the portion that matched
 				llama_kv_cache_seq_rm(context, id, n_matching_session_tokens, -1 /*up to end*/);
 				session_tokens.resize(n_matching_session_tokens);

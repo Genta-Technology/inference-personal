@@ -39,10 +39,7 @@ struct Job {
     std::vector<llama_token> embd_inp;
     std::string path_session;
     struct common_sampler* smpl = nullptr;
-    
-    int batch_pos = -1;
-    llama_token next_token;
-    bool has_next_token = false;
+    int batch_pos = 0;
 
     ~Job() {
         if (smpl) {
