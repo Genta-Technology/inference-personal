@@ -356,7 +356,7 @@ namespace
 			std::cout << "Initializing batch with size of: " << g_params.n_batch << std::endl;
 #endif
 
-			batch = llama_batch_init(params.n_ctx, 0, 8);
+			batch = llama_batch_init(params.n_ctx, 0, 1);
 
 			std::thread inferenceThread(&LlamaInferenceService::start, this);
 			inferenceThread.detach();
@@ -403,7 +403,7 @@ namespace
 					if (checkCancellation(job) || (job->n_remain <= 0 && job->params.maxNewTokens != 0)) {
 						saveSession(job);
 						common_sampler_free(job->smpl);
-						llama_kv_cache_seq_rm(context, job->jobId, 0, -1);
+						llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
 						job->isFinished = true;
 						job->cv.notify_all();
 						continue;
@@ -416,7 +416,7 @@ namespace
 						if (!sampleNextToken(job)) {
 							saveSession(job);
 							common_sampler_free(job->smpl);
-							llama_kv_cache_seq_rm(context, job->jobId, 0, -1);
+							llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
 							job->isFinished = true;
 							job->cv.notify_all();
 							continue;
@@ -426,6 +426,26 @@ namespace
 						batch_has_tokens = true;
 					}
 					else {
+						if (!loadSession(job)) {
+							common_sampler_free(job->smpl);
+							return;
+						}
+
+						if (!getInputTokens(job)) {
+							common_sampler_free(job->smpl);
+							return;
+						}
+
+						if (!ensureNonEmptyInput(job)) {
+							common_sampler_free(job->smpl);
+							return;
+						}
+
+						job->n_matching_session_tokens = matchSessionTokens(job);
+						job->n_past = static_cast<int>(job->n_matching_session_tokens);
+						job->i_prompt = static_cast<int>(job->n_matching_session_tokens);
+						job->n_prompt = job->embd_inp.size();
+
 						while (job->i_prompt < job->n_prompt) {
 							llama_token token = job->embd_inp[job->i_prompt];
 							common_batch_add(batch, token, job->i_prompt, { job->jobId }, false);
@@ -462,8 +482,6 @@ namespace
 					}
 #ifdef DEBUG
 					//printLogits(context);
-
-					std::cout << batch.n_tokens << " | " << context->n_outputs << " | " << context->logits_size << std::endl;
 #endif
 					common_batch_clear(batch);
 				}
@@ -489,25 +507,10 @@ namespace
 				job->generatedText.clear();
 			}
 
-			job->path_session = params.kvCacheFilePath;
-			if (!loadSession(job)) {
-				common_sampler_free(job->smpl);
-				return;
-			}
-			
-			job->embd_inp = getInputTokens(params, job->session_tokens);
-			if (!ensureNonEmptyInput(job)) {
-				common_sampler_free(job->smpl);
-				return;
-			}
-
-			job->n_matching_session_tokens	= matchSessionTokens(job->session_tokens, job->embd_inp, job->jobId);
-			job->n_past						= static_cast<int>(job->n_matching_session_tokens);
+			job->path_session				= params.kvCacheFilePath;
 			job->n_remain					= params.maxNewTokens;
-			job->i_prompt					= static_cast<int>(job->n_matching_session_tokens);
 			job->isDecodingPrompt			= true;
 			job->isFinished					= false;
-			job->n_prompt					= job->embd_inp.size();
 
 			{
 				std::lock_guard<std::mutex> lock(mtx);
@@ -567,7 +570,6 @@ namespace
 		llama_batch							batch;
 		std::vector<std::shared_ptr<Job>>	jobs;
 		std::atomic<bool>					should_terminate{ false };
-		std::atomic<int>					next_job_id{ 0 };
 
 		const int n_batch;
 		const int n_keep;
@@ -648,10 +650,6 @@ namespace
 		}
 #endif
 
-		int getNextJobId() {
-			return next_job_id++;
-		}
-
 		bool validateParameters(const CompletionParameters& params, std::shared_ptr<Job> job) {
 			if (!params.isValid()) {
 				std::lock_guard<std::mutex> jobLock(job->mtx);
@@ -684,7 +682,7 @@ namespace
 
 		bool loadSession(const std::string& path_session, std::vector<llama_token>& session_tokens, std::shared_ptr<Job> job) {
 			if (!path_session.empty()) {
-				if (!load_kv_cache(path_session, session_tokens)) {
+				if (!load_kv_cache(path_session, session_tokens, job->jobId)) {
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 					job->hasError = true;
 					job->errorMessage = "Could not load KV cache from " + path_session;
@@ -697,7 +695,7 @@ namespace
 
 		bool loadSession(std::shared_ptr<Job> job) {
 			if (!job->path_session.empty()) {
-				if (!load_kv_cache(job->path_session, job->session_tokens)) {
+				if (!load_kv_cache(job->path_session, job->session_tokens, job->jobId)) {
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 					job->hasError = true;
 					job->errorMessage = "Could not load KV cache from " + job->path_session;
@@ -708,12 +706,12 @@ namespace
 			return true;
 		}
 
-		std::vector<llama_token> getInputTokens(const CompletionParameters& params, const std::vector<llama_token>& session_tokens) {
-			if (session_tokens.empty() || !params.prompt.empty()) {
-				return tokenizer->tokenize(params.prompt, tokenizer->shouldAddBos());
+		bool getInputTokens(std::shared_ptr<Job> job) {
+			if (job->session_tokens.empty() || !job->params.prompt.empty()) {
+				job->embd_inp = tokenizer->tokenize(job->params.prompt, tokenizer->shouldAddBos());
 			}
 			else {
-				return session_tokens;
+				job->embd_inp = job->session_tokens;
 			}
 		}
 
@@ -862,12 +860,6 @@ namespace
 		}
 
 		bool sampleNextToken(std::shared_ptr<Job> job) {
-#ifdef DEBUG
-			std::cout << "[INFERENCE] [DECODING] job id: " << job->jobId << std::endl;
-			std::cout << "[INFERENCE] [DECODING] n outputs: " << context->n_outputs << std::endl;
-			std::cout << "[INFERENCE] [DECODING] n batch: " << batch.n_tokens << std::endl;
-#endif
-
 			llama_token id = common_sampler_sample(job->smpl, context, job->batch_pos);
 			common_sampler_accept(job->smpl, id, false);
 			common_batch_add(batch, id, job->n_past, { job->jobId }, true);
@@ -895,19 +887,13 @@ namespace
 			return true;
 		}
 
-		void saveSession(const std::string& path_session, const std::vector<llama_token>& session_tokens) {
-			if (!path_session.empty()) {
-				llama_state_save_file(context, path_session.c_str(), session_tokens.data(), session_tokens.size());
-			}
-		}
-
 		void saveSession(std::shared_ptr<Job> job) {
 			if (!job->path_session.empty()) {
-				llama_state_save_file(context, job->path_session.c_str(), job->session_tokens.data(), job->session_tokens.size());
+				llama_state_seq_save_file(context, job->path_session.c_str(), job->jobId, job->session_tokens.data(), job->session_tokens.size());
 			}
 		}
 
-		bool load_kv_cache(const std::string& path, std::vector<llama_token>& session_tokens)
+		bool load_kv_cache(const std::string& path, std::vector<llama_token>& session_tokens, const int jobId)
 		{
 			if (!path.empty()) 
 			{
@@ -928,9 +914,10 @@ namespace
 					session_tokens.resize(g_params.n_ctx);  // allocate buffer
 					size_t n_token_count_out = 0;
 
-					if (!llama_state_load_file(
+					if (!llama_state_seq_load_file(
 						context,
 						path.c_str(),
+						jobId,
 						session_tokens.data(),
 						session_tokens.capacity(),
 						&n_token_count_out
@@ -950,16 +937,16 @@ namespace
 			}
 		}
 
-		size_t matchSessionTokens(std::vector<llama_token>& session_tokens, const std::vector<llama_token>& embd_inp, const int id = 0)
+		size_t matchSessionTokens(std::shared_ptr<Job> job)
 		{
 			size_t n_matching_session_tokens = 0;
 
-			if (!session_tokens.empty()) {
+			if (!job->session_tokens.empty()) {
 				const size_t n_preserve = g_params.n_keep;
 
-				if (embd_inp.size() < n_preserve) {
-					for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
-						if (embd_inp[i] != session_tokens[i])
+				if (job->embd_inp.size() < n_preserve) {
+					for (size_t i = 0; i < job->embd_inp.size() && i < job->session_tokens.size(); i++) {
+						if (job->embd_inp[i] != job->session_tokens[i])
 							break;
 						n_matching_session_tokens++;
 					}
@@ -968,15 +955,15 @@ namespace
 					// First, check the preserved prefix.
 					bool prefix_matches = true;
 					for (size_t i = 0; i < n_preserve; i++) {
-						if (embd_inp[i] != session_tokens[i]) {
+						if (job->embd_inp[i] != job->session_tokens[i]) {
 							prefix_matches = false;
 							break;
 						}
 					}
 					if (!prefix_matches) {
 						// Fallback to simple matching from the beginning.
-						for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
-							if (embd_inp[i] != session_tokens[i])
+						for (size_t i = 0; i < job->embd_inp.size() && i < job->session_tokens.size(); i++) {
+							if (job->embd_inp[i] != job->session_tokens[i])
 								break;
 							n_matching_session_tokens++;
 						}
@@ -984,30 +971,30 @@ namespace
 					else {
 						// The preserved prefix matches.
 						// Compute the expected gap (i.e. the number of tokens that were dropped during shifting).
-						size_t gap = (embd_inp.size() > session_tokens.size())
-							? embd_inp.size() - session_tokens.size()
+						size_t gap = (job->embd_inp.size() > job->session_tokens.size())
+							? job->embd_inp.size() - job->session_tokens.size()
 							: 0;
 						// Check the shifted suffix.
 						bool shifted_matches = true;
-						size_t shifted_tokens = session_tokens.size() > n_preserve ? session_tokens.size() - n_preserve : 0;
+						size_t shifted_tokens = job->session_tokens.size() > n_preserve ? job->session_tokens.size() - n_preserve : 0;
 						for (size_t i = 0; i < shifted_tokens; i++) {
 							size_t prompt_index = n_preserve + gap + i;
-							if (prompt_index >= embd_inp.size() || embd_inp[prompt_index] != session_tokens[n_preserve + i]) {
+							if (prompt_index >= job->embd_inp.size() || job->embd_inp[prompt_index] != job->session_tokens[n_preserve + i]) {
 								shifted_matches = false;
 								break;
 							}
 						}
 						if (shifted_matches) {
 							// We can reuse the whole session_tokens.
-							n_matching_session_tokens = session_tokens.size();
+							n_matching_session_tokens = job->session_tokens.size();
 #ifdef DEBUG
 							std::cout << "[INFERENCE] [KV] Matched preserved prefix and shifted suffix." << std::endl;
 #endif
 						}
 						else {
 							// If shifted part doesn't match, fall back to matching as much as possible.
-							for (size_t i = 0; i < embd_inp.size() && i < session_tokens.size(); i++) {
-								if (embd_inp[i] != session_tokens[i])
+							for (size_t i = 0; i < job->embd_inp.size() && i < job->session_tokens.size(); i++) {
+								if (job->embd_inp[i] != job->session_tokens[i])
 									break;
 								n_matching_session_tokens++;
 							}
@@ -1016,33 +1003,33 @@ namespace
 				}
 
 #ifdef DEBUG
-				if (n_matching_session_tokens == embd_inp.size()) {
+				if (n_matching_session_tokens == job->embd_inp.size()) {
 					std::cout << "[INFERENCE] Session file has an exact match for the prompt." << std::endl;
 				}
-				else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
+				else if (n_matching_session_tokens < (job->embd_inp.size() / 2)) {
 					std::cout << "[INFERENCE] Session file has low similarity to prompt ("
-						<< n_matching_session_tokens << " / " << embd_inp.size()
+						<< n_matching_session_tokens << " / " << job->embd_inp.size()
 						<< "); will mostly be re-evaluated." << std::endl;
 				}
 				else {
 					std::cout << "[INFERENCE] Session file matches "
 						<< n_matching_session_tokens << " / "
-						<< embd_inp.size() << " tokens of prompt." << std::endl;
+						<< job->embd_inp.size() << " tokens of prompt." << std::endl;
 				}
 #endif
 
-				if (session_tokens.size() > embd_inp.size() && n_matching_session_tokens > 0)
+				if (job->session_tokens.size() > job->embd_inp.size() && n_matching_session_tokens > 0)
 				{
 					--n_matching_session_tokens; // always force to re-evaluate the last token
 				}
 
 				// Remove any "future" tokens that don’t match
 				// i.e. we only keep the portion that matched
-				llama_kv_cache_seq_rm(context, id, n_matching_session_tokens, -1 /*up to end*/);
-				session_tokens.resize(n_matching_session_tokens);
+				llama_kv_cache_seq_rm(context, job->jobId, n_matching_session_tokens, -1 /*up to end*/);
+				job->session_tokens.resize(n_matching_session_tokens);
 #ifdef DEBUG
-				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(session_tokens.size() - n_matching_session_tokens));
-				printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
+				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(job->session_tokens.size() - n_matching_session_tokens));
+				printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(job->session_tokens).c_str());
 #endif
 			}
 
@@ -1085,7 +1072,7 @@ struct InferenceEngine::Impl
 	std::unique_ptr<InferenceService> inferenceService;
 
 	// Job management members
-	std::atomic<int> nextJobId{ 0 };
+	std::atomic<int> nextJobId{ 1 };
 	std::unordered_map<int, std::shared_ptr<Job>> jobs;
 	std::mutex jobsMutex;
 
@@ -1138,9 +1125,10 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 	params.n_keep						= 2048;
 	params.use_mlock					= true;
 	params.use_mmap						= false;
-	params.cont_batching				= false;
+	params.cont_batching				= true;
 	params.warmup						= false;
 	params.cpuparams.n_threads			= inferenceThreads;
+	params.n_parallel					= 8;
 	//params.flash_attn					= true;
 #if defined(USE_CUDA) || defined(USE_VULKAN)
 	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
@@ -1245,13 +1233,13 @@ int InferenceEngine::Impl::submitChatCompletionsJob(const ChatCompletionParamete
 				job->hasError = true;
 				job->errorMessage = e.what();
 
-				std::cerr << "[INFERENCE] [ERROR] " << e.what() << "\n" << std::endl;
+				std::cerr << "[INFERENCE] [ERROR] [submitChatCompletionsJob] " << e.what() << "\n" << std::endl;
 			}
 			});
 	}
 	catch (const std::exception& e)
 	{
-		std::cerr << "[INFERENCE] [ERROR] " << e.what() << std::endl;
+		std::cerr << "[INFERENCE] [ERROR] [submitChatCompletionsJob] " << e.what() << std::endl;
 		return -1;
 	}
 
@@ -1283,7 +1271,7 @@ bool InferenceEngine::Impl::isJobFinished(int job_id)
 		auto it = jobs.find(job_id);
 		if (it == jobs.end())
 		{
-			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			std::cerr << "[INFERENCE] [ERROR] [isJobFinished] Invalid job ID: " << job_id << "\n" << std::endl;
 			return false;
 		}
 		job = it->second;
@@ -1308,7 +1296,7 @@ CompletionResult InferenceEngine::Impl::getJobResult(int job_id)
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) 
 		{
-			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			std::cerr << "[INFERENCE] [ERROR] [getJobResult] Invalid job ID " << job_id << "\n" << std::endl;
 			return { {}, "" };
 		}
 		job = it->second;
@@ -1327,7 +1315,8 @@ void InferenceEngine::Impl::waitForJob(int job_id)
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) 
 		{
-			throw std::runtime_error("[INFERENCE] [ERROR] Invalid job ID\n");
+			std::cerr << "[INFERENCE] [ERROR] [waitForJob] Invalid job ID " << job_id << "\n";
+			return;
 		}
 		job = it->second;
 	}
@@ -1345,7 +1334,7 @@ bool InferenceEngine::Impl::hasJobError(int job_id)
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) 
 		{
-			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			std::cerr << "[INFERENCE] [ERROR] [hasJobError] Invalid job ID " << job_id << "\n" << std::endl;
 			return false;
 		}
 		job = it->second;
@@ -1364,7 +1353,7 @@ std::string InferenceEngine::Impl::getJobError(int job_id)
 		auto it = jobs.find(job_id);
 		if (it == jobs.end()) 
 		{
-			std::cerr << "[INFERENCE] [ERROR] Invalid job ID\n" << std::endl;
+			std::cerr << "[INFERENCE] [ERROR] [getJobError] Invalid job ID " << job_id << "\n" << std::endl;
 			return "";
 		}
 		job = it->second;
