@@ -397,7 +397,7 @@ namespace
 				{
 					std::lock_guard<std::mutex> jobLock(job->mtx);
 
-					if (job->isFinished)
+					if (job->isFinished || job->hasError)
 						continue;
 
 					if (checkCancellation(job) || (job->n_remain <= 0 && job->params.maxNewTokens != 0)) {
@@ -410,7 +410,15 @@ namespace
 					}
 
 					if (!ensureContextCapacity(job))
+					{
+						common_sampler_free(job->smpl);
+						llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
+						job->hasError = true;
+						job->isFinished = true;
+						job->errorMessage = "Context overflow even after trimming.";
+						job->cv.notify_all();
 						continue;
+					}
 
 					if (!job->isDecodingPrompt) {
 						if (!sampleNextToken(job)) {
@@ -428,17 +436,32 @@ namespace
 					else {
 						if (!loadSession(job)) {
 							common_sampler_free(job->smpl);
-							return;
+							llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
+							job->hasError = true;
+							job->isFinished = true;
+							job->errorMessage = "Failed to load sessions";
+							job->cv.notify_all();
+							continue;
 						}
 
 						if (!getInputTokens(job)) {
 							common_sampler_free(job->smpl);
-							return;
+							llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
+							job->hasError = true;
+							job->isFinished = true;
+							job->errorMessage = "Failed to tokenize input";
+							job->cv.notify_all();
+							continue;
 						}
 
 						if (!ensureNonEmptyInput(job)) {
 							common_sampler_free(job->smpl);
-							return;
+							llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
+							job->hasError = true;
+							job->isFinished = true;
+							job->errorMessage = "Failed to ensure input content";
+							job->cv.notify_all();
+							continue;
 						}
 
 						job->n_matching_session_tokens = matchSessionTokens(job);
@@ -762,10 +785,6 @@ namespace
 			if (job->n_past + 1 > n_ctx) {
 				kv_cache_seq_ltrim(context, n_keep, job->session_tokens, job->n_past, job->jobId);
 				if (job->n_past + 1 > n_ctx) {
-					std::lock_guard<std::mutex> jobLock(job->mtx);
-					job->hasError = true;
-					job->errorMessage = "Context overflow even after trimming.";
-					job->cv.notify_all();
 					return false;
 				}
 			}
