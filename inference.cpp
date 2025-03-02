@@ -20,7 +20,7 @@
 
 class ThreadPool {
 public:
-	explicit ThreadPool();
+	explicit ThreadPool(const int maxBatch = 1);
 	~ThreadPool();
 
 	// Submit a task to the thread pool
@@ -52,9 +52,9 @@ private:
 // Thread Pool function definitions
 //-------------------------------------------------------------------------------------------------
 
-inline ThreadPool::ThreadPool() : stop(false)
+inline ThreadPool::ThreadPool(const int maxBatch) : stop(false)
 {
-	size_t num_threads = 4;
+	size_t num_threads = maxBatch;
 
 #ifdef DEBUG
 	std::cout << "[INFERENCE] Creating thread pool with " << num_threads << " threads" << std::endl;
@@ -1097,7 +1097,7 @@ struct InferenceEngine::Impl
 
 	ThreadPool threadPool;
 
-	Impl(const char* engineDir, const int mainGpuId = 0);
+	Impl(const char* engineDir, const int mainGpuId = 0, const int maxBatch = 1);
 	~Impl();
 
 	int submitCompletionsJob(const CompletionParameters& params);
@@ -1110,8 +1110,8 @@ struct InferenceEngine::Impl
 	std::string getJobError(int job_id);
 };
 
-InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
-	: threadPool()
+InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId, const int maxBatch)
+	: threadPool(maxBatch)
 {
 #ifndef DEBUG
 	llama_log_set(llama_log_callback_null, NULL);
@@ -1147,7 +1147,9 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 	params.cont_batching				= true;
 	params.warmup						= false;
 	params.cpuparams.n_threads			= inferenceThreads;
-	params.n_parallel					= 8;
+	params.n_parallel					= maxBatch;
+	params.n_batch						= 4096;
+	params.n_ubatch						= 2048;
 	//params.flash_attn					= true;
 #if defined(USE_CUDA) || defined(USE_VULKAN)
 	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
@@ -1184,7 +1186,7 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId)
 		ggml_threadpool_params_init(&threadpool_params, inferenceThreads);
 		threadpool_params.prio = GGML_SCHED_PRIO_REALTIME;
 		set_process_priority(GGML_SCHED_PRIO_REALTIME);
-		struct ggml_threadpool* threadpool			= ggml_threadpool_new(&threadpool_params);
+		struct ggml_threadpool* threadpool = ggml_threadpool_new(&threadpool_params);
 		llama_attach_threadpool(ctx, threadpool, nullptr);
 
 		inferenceService = std::make_unique<LlamaInferenceService>(tokenizer, model, ctx, params, threadpool);
@@ -1396,7 +1398,7 @@ INFERENCE_API InferenceEngine::InferenceEngine()
 {
 }
 
-INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int mainGpuId)
+INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int mainGpuId, const int maxBatch)
 {
 #ifdef DEBUG
 	std::cout << "[INFERENCE] Loading model from " << engineDir << std::endl;
@@ -1404,7 +1406,7 @@ INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int m
 	this->pimpl.reset();
 
 	try {
-		this->pimpl = std::make_unique<Impl>(engineDir, mainGpuId);
+		this->pimpl = std::make_unique<Impl>(engineDir, mainGpuId, maxBatch);
 	}
 	catch (const std::exception& e) {
 		std::cerr << "[INFERENCE] [ERROR] Could not load model from: " << engineDir << "\nError: " << e.what() << "\n" << std::endl;
