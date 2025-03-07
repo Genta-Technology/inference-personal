@@ -400,6 +400,7 @@ namespace
 					if (job->isFinished || job->hasError)
 						continue;
 
+					// TODO: Cancellation data transfer need to be implemented safely, currently it raise error in the mutex
 					if (checkCancellation(job) || (job->n_remain <= 0 && job->params.maxNewTokens != 0)) {
 						saveSession(job);
 						common_sampler_free(job->smpl);
@@ -434,6 +435,7 @@ namespace
 						batch_has_tokens = true;
 					}
 					else {
+						// TODO: Handle when failed to load session, simply delete the session file, and start with an empty session
 						if (!loadSession(job)) {
 							common_sampler_free(job->smpl);
 							llama_kv_cache_seq_rm(context, job->jobId, -1, -1);
@@ -771,14 +773,7 @@ namespace
 		}
 
 		bool checkCancellation(std::shared_ptr<Job> job) {
-			if (job->cancelRequested.load()) {
-				std::lock_guard<std::mutex> jobLock(job->mtx);
-				job->errorMessage = "Generation cancelled by user.";
-				job->isFinished = true;
-				job->cv.notify_all();
-				return true;
-			}
-			return false;
+			return job->cancelRequested.load();
 		}
 
 		bool ensureContextCapacity(std::shared_ptr<Job> job) {
@@ -914,35 +909,52 @@ namespace
 
 		bool load_kv_cache(const std::string& path, std::vector<llama_token>& session_tokens, const int jobId)
 		{
-			if (!path.empty()) 
+			if (!path.empty())
 			{
 				// Attempt to load
-				if (!std::filesystem::exists(path)) 
+				if (!std::filesystem::exists(path))
 				{
 					// file doesn't exist => no old cache
 					printf("[KV] session file does not exist, will create.\n");
+					return true;
 				}
-				else if (std::filesystem::is_empty(path)) 
+				else if (std::filesystem::is_empty(path))
 				{
 					// file is empty => treat as brand-new
 					printf("[KV] session file is empty, new session.\n");
+					return true;
 				}
-				else 
+				else
 				{
 					// The file exists and is not empty
 					session_tokens.resize(g_params.n_ctx);  // allocate buffer
 					size_t n_token_count_out = 0;
 
-					if (!llama_state_seq_load_file(
+					bool load_success = llama_state_seq_load_file(
 						context,
 						path.c_str(),
 						jobId,
 						session_tokens.data(),
 						session_tokens.capacity(),
 						&n_token_count_out
-					)) 
+					);
+
+					if (!load_success)
 					{
-						return false;
+						// Loading failed - delete the corrupt file and create a new one
+						printf("[KV] ERROR: Failed to load session file, deleting corrupt file and creating a new one.\n");
+						try {
+							std::filesystem::remove(path);
+						}
+						catch (const std::filesystem::filesystem_error& e) {
+							printf("[KV] WARNING: Could not delete corrupt session file: %s\n", e.what());
+						}
+
+						// Clear any partial data
+						session_tokens.clear();
+
+						// Return true to continue with a new cache instead of failing
+						return true;
 					}
 
 					// The llama_state_load_file call gives us how many tokens were in that old session
@@ -952,8 +964,10 @@ namespace
 					printf("[INFERENCE] [KV] loaded session with prompt size: %d tokens\n", (int)session_tokens.size());
 					printf("[INFERENCE] [KV] tokens decoded: %s\n", tokenizer->detokenize(session_tokens).c_str());
 #endif
+					return true;
 				}
 			}
+			return true;
 		}
 
 		size_t matchSessionTokens(std::shared_ptr<Job> job)
@@ -1097,7 +1111,7 @@ struct InferenceEngine::Impl
 
 	ThreadPool threadPool;
 
-	Impl(const char* engineDir, const int mainGpuId = 0, const int maxBatch = 1);
+	Impl(const char* engineDir, const LoadingParameters lParams, const int mainGpuId = 0);
 	~Impl();
 
 	int submitCompletionsJob(const CompletionParameters& params);
@@ -1110,8 +1124,8 @@ struct InferenceEngine::Impl
 	std::string getJobError(int job_id);
 };
 
-InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId, const int maxBatch)
-	: threadPool(maxBatch)
+InferenceEngine::Impl::Impl(const char* engineDir, const LoadingParameters lParams, const int mainGpuId)
+	: threadPool(lParams.n_parallel)
 {
 #ifndef DEBUG
 	llama_log_set(llama_log_callback_null, NULL);
@@ -1140,21 +1154,19 @@ InferenceEngine::Impl::Impl(const char* engineDir, const int mainGpuId, const in
 
 	common_params params;
 	params.model						= tokenizer_model_path.string().c_str();
-	params.n_ctx						= 4096;
-	params.n_keep						= 2048;
-	params.use_mlock					= true;
-	params.use_mmap						= false;
-	params.cont_batching				= true;
-	params.warmup						= false;
+	params.n_ctx						= lParams.n_ctx;
+	params.n_keep						= lParams.n_keep;
+	params.use_mlock					= lParams.use_mlock;
+	params.use_mmap						= lParams.use_mmap;
+	params.cont_batching				= lParams.cont_batching;
+	params.warmup						= lParams.warmup;
 	params.cpuparams.n_threads			= inferenceThreads;
-	params.n_parallel					= maxBatch;
-	params.n_batch						= 4096;
-	params.n_ubatch						= 2048;
+	params.n_parallel					= lParams.n_parallel;
 	//params.flash_attn					= true;
 #if defined(USE_CUDA) || defined(USE_VULKAN)
 	std::cout << "[INFERENCE] Using CUDA or Vulkan" << std::endl;
 
-	params.n_gpu_layers = 100;
+	params.n_gpu_layers = lParams.n_gpu_layers;
 #endif
 
 	std::cout << "[INFERENCE] Using main GPU ID: " << params.main_gpu << std::endl;
@@ -1273,13 +1285,22 @@ int InferenceEngine::Impl::submitChatCompletionsJob(const ChatCompletionParamete
 }
 
 void InferenceEngine::Impl::stopJob(int job_id) {
-	std::lock_guard<std::mutex> lock(jobsMutex);
-	auto it = jobs.find(job_id);
-	if (it != jobs.end()) {
-		it->second->cancelRequested.store(true);
-		// Optionally notify any waiting threads:
-		std::lock_guard<std::mutex> jobLock(it->second->mtx);
-		it->second->cv.notify_all();
+	std::shared_ptr<Job> jobToStop;
+
+	{
+		std::lock_guard<std::mutex> lock(jobsMutex);
+		auto it = jobs.find(job_id);
+		if (it == jobs.end()) {
+			return;  // Job not found
+		}
+		jobToStop = it->second;
+	}
+
+	jobToStop->cancelRequested.store(true);
+
+	{
+		std::lock_guard<std::mutex> jobLock(jobToStop->mtx);
+		jobToStop->cv.notify_all();
 	}
 }
 
@@ -1293,7 +1314,7 @@ bool InferenceEngine::Impl::isJobFinished(int job_id)
 		if (it == jobs.end())
 		{
 			std::cerr << "[INFERENCE] [ERROR] [isJobFinished] Invalid job ID: " << job_id << "\n" << std::endl;
-			return false;
+			return true;
 		}
 		job = it->second;
 	}
@@ -1398,7 +1419,7 @@ INFERENCE_API InferenceEngine::InferenceEngine()
 {
 }
 
-INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int mainGpuId, const int maxBatch)
+INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const LoadingParameters lParams, const int mainGpuId)
 {
 #ifdef DEBUG
 	std::cout << "[INFERENCE] Loading model from " << engineDir << std::endl;
@@ -1406,7 +1427,7 @@ INFERENCE_API bool InferenceEngine::loadModel(const char* engineDir, const int m
 	this->pimpl.reset();
 
 	try {
-		this->pimpl = std::make_unique<Impl>(engineDir, mainGpuId, maxBatch);
+		this->pimpl = std::make_unique<Impl>(engineDir, lParams, mainGpuId);
 	}
 	catch (const std::exception& e) {
 		std::cerr << "[INFERENCE] [ERROR] Could not load model from: " << engineDir << "\nError: " << e.what() << "\n" << std::endl;
