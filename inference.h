@@ -13,10 +13,18 @@
 #include <atomic>
 #include <exception>
 
+#ifdef _WIN32
 #ifdef INFERENCE_EXPORTS
 #define INFERENCE_API __declspec(dllexport)
 #else
 #define INFERENCE_API __declspec(dllimport)
+#endif
+#else
+#ifdef INFERENCE_EXPORTS
+#define INFERENCE_API __attribute__((visibility("default")))
+#else
+#define INFERENCE_API
+#endif
 #endif
 
 /**

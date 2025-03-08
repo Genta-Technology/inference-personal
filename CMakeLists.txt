@@ -15,6 +15,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# Detect if the architecture is ARM (AArch64)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64|arm64|armv8|armv7)")
+    message(STATUS "Building on ARM: Enabling -fPIC")
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+else()
+    message(STATUS "Building on x86: No -fPIC required")
+endif()
+
 ucm_print_flags()
 
 # Source files

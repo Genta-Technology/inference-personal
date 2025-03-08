@@ -1,4 +1,4 @@
-﻿#include <filesystem>
+ï»¿#include <filesystem>
 #include <stdexcept>
 #include <iostream>
 #include <queue>
@@ -562,6 +562,7 @@ namespace
 
 		void submitJob(const CompletionParameters& params, std::shared_ptr<Job> job) override
 		{
+			llama_kv_cache_clear(context);
 #ifdef DEBUG
 			std::cout << "[INFERENCE] Submitting job with prompt: \n" << params.prompt << std::endl;
 #endif
@@ -693,7 +694,7 @@ namespace
 			// Print top N tokens with highest logits
 			std::cout << "\nTop " << maxLogits << " tokens:\n";
 			std::cout << "|--------|------------|---------------------------------|\n";
-			std::cout << "| Token  │ Logit      │ Text                            │\n";
+			std::cout << "| Token  â Logit      â Text                            â\n";
 			std::cout << "|--------|------------|---------------------------------|\n";
 
 			for (size_t i = 0; i < std::min(maxLogits, token_logits.size()); i++) {
@@ -709,7 +710,7 @@ namespace
 					if (c == '\n') escaped_text += "\\n";
 					else if (c == '\r') escaped_text += "\\r";
 					else if (c == '\t') escaped_text += "\\t";
-					else if (c < 32 || c > 126) escaped_text += "·";
+					else if (c < 32 || c > 126) escaped_text += "Â·";
 					else escaped_text += c;
 				}
 
@@ -1018,7 +1019,7 @@ namespace
 				printf("[INFERENCE] [KV] removed %d tokens from the cache\n", (int)(job->session_tokens.size() - n_matching_session_tokens));
 #endif
 
-				// Remove any "future" tokens that don’t match
+				// Remove any "future" tokens that donât match
 				// i.e. we only keep the portion that matched
 				llama_kv_cache_seq_rm(context, job->seqId, n_matching_session_tokens, -1 /*up to end*/);
 				job->session_tokens.resize(n_matching_session_tokens);
