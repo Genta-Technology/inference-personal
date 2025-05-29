@@ -1,4 +1,4 @@
-ï»¿#include <filesystem>
+#include <filesystem>
 #include <stdexcept>
 #include <iostream>
 #include <queue>

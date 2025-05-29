@@ -180,16 +180,6 @@ else()
 endif()
 
 
-# Add test
-add_executable(test_inference test.cpp)
-target_include_directories(test_inference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_inference PRIVATE ${TARGET_NAME})
-
-# Put the test in the bin directory
-set_target_properties(test_inference PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
-
 # Add test simple
 add_executable(test_simple test_simple.cpp)
 target_include_directories(test_simple PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
