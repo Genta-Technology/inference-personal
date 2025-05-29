@@ -45,6 +45,7 @@ target_compile_definitions(${TARGET_NAME} PRIVATE INFERENCE_EXPORTS)
 # Include directories for ${TARGET_NAME}
 target_include_directories(${TARGET_NAME} PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/external/nlohmann
 )
 
 install(TARGETS ${TARGET_NAME} RUNTIME)
@@ -54,6 +55,13 @@ set(LLAMA_CPP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp")
 if(NOT EXISTS "${LLAMA_CPP_PATH}/CMakeLists.txt")
   message(FATAL_ERROR "llama.cpp not found at ${LLAMA_CPP_PATH}. Please clone it or adjust LLAMA_CPP_PATH.")
 endif()
+
+set(CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/external/curl" ${CMAKE_PREFIX_PATH})
+find_package(CURL REQUIRED)
+if(NOT CURL_FOUND)
+    message(FATAL_ERROR "CURL not found")
+endif()
+message(STATUS "Found CURL: ${CURL_INCLUDE_DIR}")
 
 # Disable GGML_NATIVE for llama.cpp for cross-compilation
 set(GGML_NATIVE           OFF CACHE BOOL "Disable LLAMA_NATIVE in llama.cpp" FORCE)
@@ -65,6 +73,8 @@ set(LLAMA_BUILD_EXAMPLES  OFF CACHE BOOL "Disable llama.cpp examples"     FORCE)
 set(LLAMA_BUILD_SERVER    OFF CACHE BOOL "Disable llama.cpp server"       FORCE)
 set(LLAMA_BUILD_COMMON    ON  CACHE BOOL "Enable  llama.cpp common"       FORCE)
 set(LLAMA_ALL_WARNINGS    OFF CACHE BOOL "Disable warnings in llama.cpp"  FORCE)
+set(LLAMA_CURL            ON  CACHE BOOL "Disable curl in llama.cpp"      FORCE)
+set(LLAMA_TOOLCALL        ON  CACHE BOOL "Enable llama.cpp toolcall"      FORCE)
 
 # Build llama.cpp as a static library
 set(BUILD_SHARED_LIBS	  OFF CACHE BOOL "Build llama.cpp as a static lib" FORCE)
@@ -112,7 +122,7 @@ target_compile_definitions(${TARGET_NAME} PUBLIC
 add_subdirectory(${LLAMA_CPP_PATH})
 
 # Link llama.cpp library
-target_link_libraries(${TARGET_NAME} PRIVATE llama common ggml)
+target_link_libraries(${TARGET_NAME} PRIVATE llama common ggml toolcall)
 
 target_compile_features(${TARGET_NAME} PRIVATE cxx_std_17)
 
@@ -169,5 +179,35 @@ target_link_libraries(test_inference PRIVATE ${TARGET_NAME})
 
 # Put the test in the bin directory
 set_target_properties(test_inference PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Add test simple
+add_executable(test_simple test_simple.cpp)
+target_include_directories(test_simple PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_simple PRIVATE ${TARGET_NAME})
+
+# Put the test in the bin directory
+set_target_properties(test_simple PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Copy the libcurl.dll to the bin directory
+if(WIN32)
+  add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CURL_INCLUDE_DIR}/../bin/libcurl.dll"
+      "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+    COMMENT "Copying libcurl.dll to bin directory"
+  )
+endif()
+
+# Add test simple completion
+add_executable(test_simple_completion test_simple_completion.cpp)
+target_include_directories(test_simple_completion PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_simple_completion PRIVATE ${TARGET_NAME})
+
+# Put the test in the bin directory
+set_target_properties(test_simple_completion PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

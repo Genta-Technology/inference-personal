@@ -32,3 +32,4 @@ venv/**
 
 .vs/
 .vscode/
+/LICENSE.zip
