@@ -16,7 +16,8 @@
 #include <dlfcn.h>
 #endif
 
-typedef InferenceEngine* (CreateInferenceEngineFunc)();
+typedef IInferenceEngine* (*CreateInferenceEngineFunc)();
+typedef void (*DestroyInferenceEngineFunc)(IInferenceEngine*);
 
 // Helper function to generate a string of repeated text to create a long prompt
 std::string generateLongPrompt(int targetLength) {
@@ -57,6 +58,7 @@ int main(int argc, char* argv[])
     std::string libraryName = "InferenceEngineLib.dll";
 #endif
 
+    if (!hModule) {
 #ifdef _WIN32
     HMODULE hModule = LoadLibraryA(libraryName.c_str());
     if (hModule == NULL)
